@@ -1,0 +1,31 @@
+[project]
+name = "hermes-pi-delegation"
+version = "2.2.0"
+description = "Hermes plugin: delegate work to isolated pi workers over pi RPC mode"
+authors = [{ name = "bmcszk", email = "dzikun@gmail.com" }]
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "UP", "SIM", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# The plugin root directory must be named after the plugin: the repo name
+# (hermes-pi-delegation) is not a valid python identifier, so N999 does not apply.
+"__init__.py" = ["N999"]
