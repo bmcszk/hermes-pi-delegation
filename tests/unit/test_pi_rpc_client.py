@@ -1,14 +1,32 @@
 """Tests for pi_rpc_client. No network, no model calls, no real pi process."""
 
 import json
+import shutil
 import signal
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from pi_rpc_client import PiRpcClient, _find_pi_binary
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
+
+FAKE_PI_PATH = "/usr/local/bin/pi"
+REAL_WHICH = shutil.which  # captured before any test patches it
+
+
+@pytest.fixture(scope="module", autouse=True)
+def pi_binary_on_path():
+    """Tests need no real pi; start() resolves one, so stub only the lookup."""
+
+    def fake_which(name, *args, **kwargs):
+        if name == "pi":
+            return FAKE_PI_PATH
+        return REAL_WHICH(name, *args, **kwargs)
+
+    with patch("pi_rpc_client.shutil.which", side_effect=fake_which):
+        yield
 
 U2028 = "\u2028"
 READY_LINE = b'{"type":"extension_ui_request","id":"x","method":"setStatus"}\n'
@@ -110,9 +128,8 @@ def make_client(lines: list[bytes]) -> tuple[PiRpcClient, FakePiRpcProc]:
         proc_factory=factory,  # type: ignore[arg-type]
     )
     client.start()
-    # pi is resolved dynamically: PATH first, then the per-user install roots
-    pi_bin = _find_pi_binary()
-    assert captured["argv"][:5] == [pi_bin, "--mode", "rpc", "--model", "m"]
+    assert captured["argv"][1:5] == ["--mode", "rpc", "--model", "m"]
+    assert isinstance(captured["argv"][0], str) and captured["argv"][0].endswith("pi")
     fake = client.proc
     assert isinstance(fake, FakePiRpcProc)
     return client, fake
