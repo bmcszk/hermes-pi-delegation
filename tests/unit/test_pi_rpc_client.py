@@ -28,6 +28,7 @@ def pi_binary_on_path():
     with patch("pi_rpc_client.shutil.which", side_effect=fake_which):
         yield
 
+
 U2028 = "\u2028"
 READY_LINE = b'{"type":"extension_ui_request","id":"x","method":"setStatus"}\n'
 

@@ -575,6 +575,7 @@ def _launch_session_id(cwd, worker_type, epic_id, task_slug):
         return f"task-{task_slug}-{worker_type}"
     return f"task-{os.path.basename(os.path.normpath(cwd))}-{worker_type}"
 
+
 def _pi_launch_impl(
     contract_path,
     cwd,
