@@ -5,8 +5,9 @@ enforce the delegation laws mechanically: a worker must cite what it changed, it
 must not narrate, and no agent may mutate git history through a tool call.
 
 The plugin is deliberately agnostic. It knows nothing about your project, your
-models, or your machine. A *worker type* is a tool policy. A *model* is an alias
-you pass on every dispatch. Your Hermes skill supplies the aliases.
+models, or your machine. A *worker type* is a tool policy. A *model* is an
+optional alias you may pass on a dispatch; without it the worker runs on pi's
+own `defaultModel`. Your Hermes skill supplies the aliases.
 
 ## Tools
 
@@ -19,12 +20,12 @@ Generates one worker dispatch.
 
 | Parameter | Required | Meaning |
 | --- | --- | --- |
-| `worker_type` | yes | `reasoner`, `brainer`, `coder`, or `auditor`. Selects the tool policy. |
-| `skills` | yes | Skill dirs (`~` or absolute) or bare names. Bare names resolve against `.agents/skills` and `.pi/skills` in the `cwd` ancestry, then `~/.agents/skills`, then `~/.hermes/skills/*`, then `~/.pi/skills`. Discovered paths are emitted absolute. pi does not inherit parent skills, so every skill the worker needs must be listed. |
 | `contract_path` | yes | File holding the worker prompt. |
 | `cwd` | yes | Absolute project directory. pi is project scoped. |
-| `model` | yes | Model alias for the worker upstream. The plugin never hardcodes one: the caller's deployment defines the aliases. |
-| `epic_id` / `task_slug` | one of them | Session id becomes `<epic_id>-<worker_type>` or `task-<slug>-<worker_type>`. |
+| `worker_type` | no | Defaults to `default`, a passthrough with no tool/codemode/thinking policy. `reasoner`, `brainer`, `coder`, `auditor` attach a policy. Unknown non-default names are an error. |
+| `skills` | no (recommended) | Skill dirs (`~` or absolute) or bare names. Bare names resolve against `.agents/skills` and `.pi/skills` in the `cwd` ancestry, then `~/.agents/skills`, then `~/.hermes/skills/*`, then `~/.pi/skills`. Discovered paths are emitted absolute. pi does not inherit parent skills, so every skill the worker needs must be listed. Omitted or empty: no `--append-system-prompt` and no `system_prompt` key. |
+| `model` | no | Model alias for the worker upstream. Omitted: the command carries no `--model` at all and pi uses its own `defaultModel` from `~/.pi/agent/settings.json`. The plugin never hardcodes one. |
+| `epic_id` / `task_slug` | no (recommended) | Session id becomes `<epic_id>-<worker_type>` or `task-<slug>-<worker_type>`. With neither, it becomes `task-<basename of cwd>-<worker_type>`: the same cwd with the same worker_type reuses that session id, and `--session-id` makes pi reuse the session state behind it. |
 | `require_edit` | no | Path or list of paths that must change for the run to count as done. Turns on the nudge gate. |
 | `min_tool_calls` | no | Tool calls required before the run counts as done. Needs `require_edit`. |
 | `max_nudges` | no | Nudges allowed before the gate gives up. Needs `require_edit`. |
@@ -35,6 +36,7 @@ Worker types carry tool policy only:
 
 | Worker type | Tools | codemode | thinking |
 | --- | --- | --- | --- |
+| `default` | pi defaults | no | pi default |
 | `reasoner` | `read,grep,find,ls` | no | high |
 | `brainer` | `read,grep,find,ls,write,edit` | no | high |
 | `coder` | pi defaults | yes | pi default |
@@ -101,7 +103,33 @@ tests/unit/                  client and sweep-runner tests
 The plugin contains no model names, no project names, and no machine paths. A
 sweep's model aliases are the caller's concern: define them in your Hermes
 skill, pass one per dispatch as `model`, and the plugin puts that exact string
-on the worker argv.
+on the worker argv. Skip `model` and the worker inherits pi's `defaultModel`.
+
+## Example dispatches
+
+Minimal: every optional parameter takes its default.
+
+```json
+{"contract_path": "/abs/contract.md", "cwd": "/abs/project"}
+```
+
+That emits `python3 .../pi_rpc_client.py --session-id task-project-default
+--cwd /abs/project ...` with no `--model` flag.
+
+Fully specified:
+
+```json
+{
+  "contract_path": "/abs/contract.md",
+  "cwd": "/abs/project",
+  "worker_type": "coder",
+  "skills": ["coding-rules", "/abs/skills/go-dev"],
+  "model": "my-alias",
+  "epic_id": "epic-1234",
+  "require_edit": ["src/app.go"],
+  "timeout_s": 1800
+}
+```
 
 ## Continuous integration
 
@@ -119,3 +147,5 @@ API:
 ## License
 
 MIT, copyright 2026 bmcszk. See `LICENSE`.
+
+<!-- ci-trigger -->

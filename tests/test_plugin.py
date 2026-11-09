@@ -393,11 +393,11 @@ def test_pi_launch_drops_plugin_fresh_when_module_is_stale(monkeypatch):
     # when launching
     result = _parse(
         p._pi_launch_impl(
-            "coder",
-            [GO_DEV],
-            CONTRACT_MD,
-            TMP_CWD,
-            "anything",
+            worker_type="coder",
+            skills=[GO_DEV],
+            contract_path=CONTRACT_MD,
+            cwd=TMP_CWD,
+            model="anything",
             epic_id="eF2",
             mode="standard",
         )
@@ -494,6 +494,7 @@ def test_unknown_worker_type():
 
 
 def test_missing_epic_and_slug():
+    # when neither epic_id nor task_slug is given
     result = _parse(
         pi_launch(
             {
@@ -505,7 +506,10 @@ def test_missing_epic_and_slug():
             }
         )
     )
-    assert "error" in result
+
+    # then the launch still succeeds with a cwd-derived session id
+    assert "error" not in result, result
+    assert result["session_id"] == f"task-{os.path.basename(os.path.normpath(TMP_CWD))}-coder"
 
 
 def test_task_slug_session():
@@ -1005,12 +1009,12 @@ def test_launch_marks_cwd_required():
     # when
     required = p._launch_required()
 
-    # then
-    assert "cwd" in required
+    # then only cwd and the contract path are mandatory
+    assert required == ["contract_path", "cwd"]
 
 
 def test_launch_marks_model_required():
-    # given a payload carrying every other required field, but no model alias
+    # given a payload that omits the model alias entirely
     payload = {
         "worker_type": "coder",
         "skills": [],
@@ -1023,10 +1027,132 @@ def test_launch_marks_model_required():
     required = p._launch_required()
     result = _parse(pi_launch(payload))
 
-    # then the schema marks model required and a real launch without it errors
-    assert "model" in required
+    # then model is optional: the command omits --model so pi uses its defaultModel
+    assert "model" not in required
+    assert "error" not in result, result
+    assert "--model" not in shlex.split(result["command"])
+
+def test_launch_omits_model_flag_when_model_is_none():
+    # given an explicit model=None
+    payload = {
+        "worker_type": "coder",
+        "skills": [],
+        "contract_path": CONTRACT_MD,
+        "cwd": TMP_CWD,
+        "epic_id": "eNoneModel",
+        "model": None,
+    }
+
+    # when
+    result = _parse(pi_launch(payload))
+
+    # then no --model flag reaches the client
+    assert "error" not in result, result
+    assert "--model" not in shlex.split(result["command"])
+
+def test_launch_explicit_model_still_wins():
+    # given an explicit alias
+    payload = {
+        "worker_type": "coder",
+        "skills": [],
+        "contract_path": CONTRACT_MD,
+        "cwd": TMP_CWD,
+        "epic_id": "eModel",
+        "model": "explicit-m",
+    }
+
+    # when
+    parts = shlex.split(_parse(pi_launch(payload))["command"])
+
+    # then the alias lands on the worker argv
+    assert parts[parts.index("--model") + 1] == "explicit-m"
+
+def test_launch_worker_type_defaults_to_default():
+    # given a payload without worker_type
+    payload = {
+        "skills": [],
+        "contract_path": CONTRACT_MD,
+        "cwd": TMP_CWD,
+        "epic_id": "eDef",
+    }
+
+    # when
+    result = _parse(pi_launch(payload))
+    parts = shlex.split(result["command"])
+
+    # then 'default' is a policy-free passthrough and names the session
+    assert "error" not in result, result
+    assert result["worker_type"] == "default"
+    assert result["session_id"] == "eDef-default"
+    assert "--tools" not in parts
+    assert "--codemode" not in parts
+    assert "--thinking" not in parts
+
+def test_launch_unknown_worker_type_still_errors():
+    # given a non-default unknown name
+    payload = {
+        "worker_type": "nope",
+        "skills": [],
+        "contract_path": CONTRACT_MD,
+        "cwd": TMP_CWD,
+        "epic_id": "eNope",
+    }
+
+    # when
+    result = _parse(pi_launch(payload))
+
+    # then the passthrough default did not soften the unknown-name error
     assert "error" in result, result
-    assert "model" in result["error"]
+    assert "nope" in result["error"]
+
+def test_launch_derives_session_id_from_cwd_when_epic_and_slug_missing():
+    # given a payload with neither epic_id nor task_slug
+    payload = {
+        "worker_type": "coder",
+        "skills": [],
+        "contract_path": CONTRACT_MD,
+        "cwd": TMP_CWD,
+    }
+
+    # when
+    result = _parse(pi_launch(payload))
+
+    # then the session id is derived from the project directory basename
+    assert "error" not in result, result
+    expected = f"task-{os.path.basename(os.path.normpath(TMP_CWD))}-coder"
+    assert result["session_id"] == expected
+    assert expected in shlex.split(result["command"])
+
+def test_launch_explicit_session_ids_still_win():
+    # when epic_id and task_slug are both present
+    both = _parse(
+        pi_launch(
+            {
+                "worker_type": "coder",
+                "skills": [],
+                "contract_path": CONTRACT_MD,
+                "cwd": TMP_CWD,
+                "epic_id": "epicWin",
+                "task_slug": "slugWin",
+            }
+        )
+    )
+    # when only task_slug is present
+    slug_only = _parse(
+        pi_launch(
+            {
+                "worker_type": "coder",
+                "skills": [],
+                "contract_path": CONTRACT_MD,
+                "cwd": TMP_CWD,
+                "task_slug": "slugWin",
+            }
+        )
+    )
+
+    # then the explicit ids still name the session
+    assert both["session_id"] == "epicWin-coder"
+    assert slug_only["session_id"] == "task-slugWin-coder"
 
 def test_launch_schema_documents_model_param():
     # when
