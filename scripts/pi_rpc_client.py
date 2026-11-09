@@ -37,7 +37,7 @@ from collections.abc import Callable
 DEFAULT_TIMEOUT_S = float(os.environ.get("PI_WORKER_TIMEOUT_S", "900"))
 
 # Best-effort registry of live agents (consumed by pi_manage list/kill).
-REGISTRY_PATH = os.path.expanduser("~/.hermes/logs/pi-agents.jsonl")
+REGISTRY_PATH = os.path.join(os.path.expanduser("~"), ".hermes", "logs", "pi-agents.jsonl")
 
 # Per-frame idle budget only guards against a SILENT worker. A hung tool that
 # still trickles progress frames resets it forever (2026-10-31: a runaway

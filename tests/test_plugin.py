@@ -8,6 +8,8 @@ import tempfile
 import threading
 import types
 
+import pytest
+
 # The repo root is the plugin root: conftest.py makes it importable, and this
 # insert keeps the plugin importable when a test file is run on its own.
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
@@ -26,6 +28,32 @@ with open(CONTRACT_MD, "w") as _f:
 
 _registry_backup = p.REGISTRY_PATH
 
+SKILLS = os.path.join(TMP_CWD, "skills")
+CODING_RULES = os.path.join(SKILLS, "coding-rules")
+GO_DEV = os.path.join(SKILLS, "go-dev")
+for _name in (CODING_RULES, GO_DEV):
+    os.makedirs(_name, exist_ok=True)
+    with open(os.path.join(_name, "SKILL.md"), "w") as _f:
+        _f.write(f"---\nname: {os.path.basename(_name)}\n---\ntest\n")
+
+@pytest.fixture(autouse=True)
+def isolated_home(monkeypatch, tmp_path):
+    """Every test builds its own world: no test may read the machine's real HOME."""
+    agent_dir = tmp_path / "agent-worker"
+    agent_dir.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(p, "WORKER_AGENT_DIR", str(agent_dir))
+    monkeypatch.setattr(p, "REGISTRY_PATH", str(tmp_path / "pi-agents.jsonl"))
+    return tmp_path
+
+@pytest.fixture
+def tmp_skill(tmp_path):
+    """A fake skill dir the test owns: no dependency on the machine's real skill roots."""
+    skill_dir = tmp_path / "skills" / "fake-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: fake-skill\n---\ntest\n")
+    return skill_dir
+
 
 def _parse(result):
     """Helper: parse JSON string from handler returns."""
@@ -33,6 +61,8 @@ def _parse(result):
 
 
 def _setup_registry(tmpdir):
+    global _registry_backup
+    _registry_backup = p.REGISTRY_PATH
     p.REGISTRY_PATH = os.path.join(tmpdir, "pi-agents.jsonl")
 
 
@@ -47,7 +77,7 @@ def test_pi_launch_standard_coder():
             {
                 "worker_type": "coder",
                 "model": "anything",
-                "skills": ["~/.agents/skills/coding-rules", "~/.agents/skills/go-dev"],
+                "skills": [CODING_RULES, GO_DEV],
                 "contract_path": CONTRACT_MD,
                 "cwd": TMP_CWD,
                 "epic_id": "epic-1n0a",
@@ -64,8 +94,8 @@ def test_pi_launch_standard_coder():
     # the caller-supplied model alias lands 1:1 on the worker argv
     assert parts[parts.index("--model") + 1] == "anything"
     assert "--session-id" in parts and "epic-1n0a-coder" in parts
-    assert "--skill" in parts and os.path.expanduser("~/.agents/skills/coding-rules") in parts
-    assert os.path.expanduser("~/.agents/skills/go-dev") in parts
+    assert "--skill" in parts and CODING_RULES in parts
+    assert GO_DEV in parts
     assert "--codemode" in parts
     assert "--ns" not in parts
 
@@ -79,7 +109,7 @@ def test_pi_launch_emits_worker_agent_dir():
             {
                 "worker_type": "coder",
                 "model": "anything",
-                "skills": ["~/.agents/skills/coding-rules"],
+                "skills": [CODING_RULES],
                 "contract_path": CONTRACT_MD,
                 "cwd": TMP_CWD,
                 "epic_id": "epic-1n0a",
@@ -101,7 +131,7 @@ def test_pi_launch_warns_when_worker_agent_dir_missing(monkeypatch, tmp_path):
             {
                 "worker_type": "coder",
                 "model": "anything",
-                "skills": ["~/.agents/skills/coding-rules"],
+                "skills": [CODING_RULES],
                 "contract_path": CONTRACT_MD,
                 "cwd": TMP_CWD,
                 "epic_id": "epic-1n0a",
@@ -121,7 +151,7 @@ def test_pi_launch_rejects_legacy_mode():
             {
                 "worker_type": "coder",
                 "model": "anything",
-                "skills": ["~/.agents/skills/coding-rules"],
+                "skills": [CODING_RULES],
                 "contract_path": CONTRACT_MD,
                 "cwd": TMP_CWD,
                 "epic_id": "epic-1n0a",
@@ -140,7 +170,7 @@ def test_pi_launch_reasoner():
             {
                 "worker_type": "reasoner",
                 "model": "anything",
-                "skills": ["~/.agents/skills/coding-rules"],
+                "skills": [CODING_RULES],
                 "contract_path": CONTRACT_MD,
                 "cwd": TMP_CWD,
                 "epic_id": "epic-uc44",
@@ -163,7 +193,7 @@ def test_worker_with_edit_tools_launch():
             {
                 "worker_type": "brainer",
                 "model": "anything",
-                "skills": ["~/.agents/skills/coding-rules"],
+                "skills": [CODING_RULES],
                 "contract_path": CONTRACT_MD,
                 "cwd": TMP_CWD,
                 "epic_id": "epic-uc44",
@@ -265,7 +295,7 @@ def test_pi_launch_resolves_bare_name_hermes_root_level(tmp_path, monkeypatch):
 
 
 def test_pi_launch_resolves_bare_name_hermes_local(tmp_path, monkeypatch):
-    # given the skill exists only under ~/.hermes/skills/<category>/
+    # given the skill exists only under a hermes skills category root
     proj = tmp_path / "proj"
     proj.mkdir()
     _write_skill(tmp_path, ".hermes/skills/dev", "probe-hermes-skill")
@@ -343,7 +373,7 @@ def test_pi_launch_emits_plugin_fresh_when_module_matches_disk():
             {
                 "worker_type": "coder",
                 "model": "anything",
-                "skills": ["~/.agents/skills/go-dev"],
+                "skills": [GO_DEV],
                 "contract_path": CONTRACT_MD,
                 "cwd": TMP_CWD,
                 "epic_id": "eF1",
@@ -364,7 +394,7 @@ def test_pi_launch_drops_plugin_fresh_when_module_is_stale(monkeypatch):
     result = _parse(
         p._pi_launch_impl(
             "coder",
-            ["~/.agents/skills/go-dev"],
+            [GO_DEV],
             CONTRACT_MD,
             TMP_CWD,
             "anything",
@@ -386,7 +416,7 @@ def test_generated_command_single_line_and_parseable():
                 {
                     "worker_type": wt,
                     "model": "anything",
-                    "skills": ["~/.agents/skills/coding-rules"],
+                    "skills": [CODING_RULES],
                     "contract_path": CONTRACT_MD,
                     "cwd": TMP_CWD,
                     "epic_id": "epicX",
@@ -522,7 +552,7 @@ def test_skill_dispatch_injects_compliance_block():
             {
                 "worker_type": "coder",
                 "model": "anything",
-                "skills": ["~/.agents/skills/coding-rules", "~/.agents/skills/go-dev"],
+                "skills": [CODING_RULES, GO_DEV],
                 "contract_path": CONTRACT_MD,
                 "cwd": TMP_CWD,
                 "epic_id": "epicSkills",
@@ -788,7 +818,7 @@ def test_cwd_flag_in_generated_command_all_worker_types():
                 {
                     "worker_type": wt,
                     "model": "anything",
-                    "skills": ["~/.agents/skills/coding-rules"],
+                    "skills": [CODING_RULES],
                     "contract_path": CONTRACT_MD,
                     "cwd": TMP_CWD,
                     "epic_id": "epicCwd",
@@ -813,7 +843,7 @@ def test_handlers_match_framework_contract():
         {
             "worker_type": "coder",
             "model": "anything",
-            "skills": ["~/.agents/skills/coding-rules"],
+            "skills": [CODING_RULES],
             "contract_path": CONTRACT_MD,
             "cwd": TMP_CWD,
             "epic_id": "epicContract",
@@ -835,7 +865,7 @@ def test_handlers_return_json_strings():
         {
             "worker_type": "coder",
             "model": "anything",
-            "skills": ["~/.agents/skills/coding-rules"],
+            "skills": [CODING_RULES],
             "contract_path": CONTRACT_MD,
             "cwd": TMP_CWD,
             "epic_id": "epicStr",
@@ -901,11 +931,9 @@ def test_launch_rejects_missing_skill():
     assert "skill not found: /nonexistent/skill" in result["error"], result
 
 
-def test_launch_warns_hermes_local_skill():
+def test_launch_warns_hermes_local_skill(tmp_skill):
     """Existing skill outside .agents/.pi discovery -> warnings, command still built."""
-    skill = os.path.join(TMP_CWD, "outside-skill.md")
-    with open(skill, "w") as f:
-        f.write("x\n")
+    skill = str(tmp_skill / "SKILL.md")
     result = _parse(
         pi_launch(
             {
