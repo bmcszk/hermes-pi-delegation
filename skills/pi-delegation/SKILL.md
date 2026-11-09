@@ -11,11 +11,21 @@ repo README; this skill is only the control loop.
 
 ## The loop
 
-1. `pi_launch(contract_path, cwd, skills, require_edit=<exact file>)` returns
-   a one-line command. Run it verbatim in the background; never hand-write it.
-2. `pi_manage(action="wait", session_id=<id>)` blocks until the run settles.
-   Never sleep and poll.
-3. Verify the work on disk yourself: diff, gates, test counts. A completion
+1. Write the contract file first: a markdown worker prompt with the task, a
+   scope guard (what NOT to touch), the gates to run, and the definition of
+   done. The worker sees nothing else, so state that must survive belongs in
+   the contract, not in chat.
+2. `pi_launch(contract_path, cwd, require_edit=<exact file>)` returns a
+   one-line command. Run it verbatim in the background; never hand-write it.
+   Pick the worker type by job: `coder` edits code, `brainer` writes
+   verdicts and docs, `reasoner` is read-only. Set `wall_timeout_s` as the
+   hard ceiling per dispatch; `min_tool_calls` and `max_nudges` arm the
+   correction loop (a worker that edits nothing is nudged up to the budget,
+   then exits 3). `epic_id` and `task_slug` name the session; run one
+   worker per project at a time.
+3. `pi_manage(action="wait", session_id=<id>)` blocks until the registry
+   line is terminal and the pid is gone. Never sleep and poll.
+4. Verify the work on disk yourself: diff, gates, test counts. A completion
    report is a claim, not a result.
 
 ## Liveness
@@ -31,6 +41,13 @@ on disk, relaunch fresh.
 `pi_manage(action="steer", session_id=<id>, message="...")` injects guidance
 into the run in progress; `queue=true` holds it for the next turn. Verify
 the message landed by the worker's next output, never by the call itself.
+
+## Reading logs
+
+`pi_manage(action="logs", session_id=<id>, lines=<n>)` tails the newest pi
+session log for a dispatch. Read it when `wait` returns a weird status or
+the tree looks wrong: the log holds the worker's last frames, tool calls,
+and its own exit summary.
 
 ## Kill and salvage
 
