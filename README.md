@@ -80,11 +80,11 @@ The plugin has no runtime dependencies. It needs `pi` on `PATH`, or under a
 per-user install root (`~/.nvm/versions/node/*/bin`, `~/.npm-global/bin`,
 `~/.local/bin`, `~/.bun/bin`).
 
-## Companion skill
+## Companion skill for Hermes
 
-The repo ships an installable skill that teaches any agent the delegation
-loop: launch, wait, steer, kill, salvage. `skills/pi-delegation/SKILL.md`
-installs with the skills CLI:
+The repo ships an installable skill for Hermes agents that covers the
+delegation loop: launch, wait, steer, kill, salvage. `skills/pi-delegation/SKILL.md`
+installs into Hermes with the skills CLI:
 
 ```sh
 skills add bmcszk/hermes-pi-delegation
