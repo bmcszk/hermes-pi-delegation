@@ -227,21 +227,31 @@ class TestFrameSplitting:
 
 
 class TestLaunchFlags:
-    def _argv(self, **kw) -> list:
+    def _argv(self, _omit_model=False, **kw) -> list:
         captured: dict = {}
 
         def factory(argv, **kwargs):
             captured["argv"] = argv
             return FakePiRpcProc(scripted_lines("x"))
 
-        client = PiRpcClient(
-            model="m",
-            cwd="/tmp/fakecwd",
-            proc_factory=factory,
-            **kw,  # type: ignore[arg-type]
-        )
+        client_kw = {"cwd": "/tmp/fakecwd", "proc_factory": factory, **kw}
+        if not _omit_model:
+            client_kw.setdefault("model", "m")
+        client = PiRpcClient(**client_kw)  # type: ignore[arg-type]
         client.start()
         return captured["argv"]
+
+    def test_model_flag_present_when_given(self):
+        argv = self._argv(model="m9")
+        i = argv.index("--model")
+        assert argv[i + 1] == "m9"
+
+    def test_model_flag_omitted_when_none(self):
+        # then pi falls back to its own defaultModel from settings.json
+        assert "--model" not in self._argv(model=None)
+
+    def test_model_flag_omitted_when_kwarg_absent(self):
+        assert "--model" not in self._argv(_omit_model=True)
 
     def test_codemode_adds_plus_t(self):
         argv = self._argv(codemode=True)

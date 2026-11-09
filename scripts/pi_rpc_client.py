@@ -133,7 +133,7 @@ class PiRpcClient:
 
     def __init__(
         self,
-        model: str,
+        model: str | None = None,
         cwd: str | None = None,
         session_id: str | None = None,
         skills: list[str] | None = None,
@@ -171,7 +171,9 @@ class PiRpcClient:
     def start(self) -> None:
         """Spawn the pi process and wait for readiness."""
         pi_bin = _find_pi_binary()
-        argv = [pi_bin, "--mode", "rpc", "--model", self.model]
+        argv = [pi_bin, "--mode", "rpc"]
+        if self.model:
+            argv += ["--model", self.model]
         if self.session_id:
             argv += ["--session-id", self.session_id]
         for skill in self.skills:
@@ -506,7 +508,7 @@ def _plugin_staleness_warning() -> str | None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="pi RPC mode client")
-    parser.add_argument("--model", required=True)
+    parser.add_argument("--model", default=None)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--cwd", default=None)
     parser.add_argument("--session-id", default=None, dest="session_id")

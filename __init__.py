@@ -17,10 +17,13 @@ CLIENT_PATH = os.path.join(os.path.dirname(__file__), "scripts", "pi_rpc_client.
 # without npm:pi-subagents and with a no-delegation AGENTS.md.
 WORKER_AGENT_DIR = os.path.join(os.path.expanduser("~"), ".pi", "agent-worker")
 
-# Worker tool policy. reasoner is read-only. brainer may write docs and
-# task files (write/edit) but has no shell. coder/auditor get codemode.
-# No model key: the model is a per-dispatch argument supplied by the caller.
+# Worker tool policy. default is a passthrough: no tool/codemode/thinking
+# policy attached. reasoner is read-only. brainer may write docs and task
+# files (write/edit) but has no shell. coder/auditor get codemode.
+# No model key: the model is an optional per-dispatch argument, and pi falls
+# back to its own defaultModel when the caller passes none.
 WORKER_TYPES = {
+    "default": {"tools": None, "use_codemode": False, "thinking": None},
     "reasoner": {"tools": "read,grep,find,ls", "use_codemode": False, "thinking": "high"},
     "brainer": {
         "tools": "read,grep,find,ls,write,edit",
@@ -155,14 +158,18 @@ def _tool_schema(name, description, properties, required):
 LAUNCH_PARAMS = {
     "worker_type": {
         "type": "string",
-        "enum": list(WORKER_TYPES.keys()),
-        "description": "reasoner/brainer are read-only-ish; coder/auditor get codemode",
+        "description": (
+            "optional, defaults to 'default' (passthrough: no tool/codemode/thinking "
+            "policy attached). reasoner: read-only tools; brainer: read+write+edit, no "
+            "shell; coder and auditor: pi defaults plus codemode"
+        ),
     },
     "skills": {
         "type": "array",
         "items": {"type": "string"},
         "description": (
-            "skill entries: dirs (~ or absolute) or bare names; names resolve as "
+            "optional but recommended; skill entries: dirs (~ or absolute) or bare names; "
+            "names resolve as "
             ".agents/.pi under cwd ancestors -> ~/.agents/skills -> ~/.hermes/skills/* "
             "-> ~/.pi/skills; discovered paths are emitted absolute; pi does not "
             "inherit parent skills"
@@ -170,13 +177,30 @@ LAUNCH_PARAMS = {
     },
     "contract_path": {"type": "string", "description": "path to the contract prompt file"},
     "cwd": {"type": "string", "description": "absolute project dir; pi is project-scoped"},
-    "epic_id": {"type": "string", "description": "session id becomes <epic_id>-<worker_type>"},
-    "task_slug": {"type": "string", "description": "session id becomes task-<slug>-<worker_type>"},
+    "epic_id": {
+        "type": "string",
+        "description": (
+            "optional; session id becomes <epic_id>-<worker_type>. Omit both epic_id and "
+            "task_slug and the session id is task-<basename of cwd>-<worker_type>: the "
+            "same cwd with the same worker_type reuses that session id, and pi reuses "
+            "the session state behind it"
+        ),
+    },
+    "task_slug": {
+        "type": "string",
+        "description": (
+            "optional; session id becomes task-<slug>-<worker_type>. Omit both epic_id "
+            "and task_slug and the session id is task-<basename of cwd>-<worker_type>: "
+            "the same cwd with the same worker_type reuses that session id, and pi "
+            "reuses the session state behind it"
+        ),
+    },
     "model": {
         "type": "string",
         "description": (
-            "model alias for the worker upstream; the caller's deployment defines "
-            "aliases, the plugin never hardcodes any"
+            "optional model alias for the worker upstream; omitted, the command carries "
+            "no --model at all and pi uses its own defaultModel. The caller's deployment "
+            "defines the aliases, the plugin never hardcodes any"
         ),
     },
     "mode": {"type": "string", "enum": ["standard"]},
@@ -543,12 +567,20 @@ def pi_launch(args: dict, **_):
     return _call_impl("_pi_launch_impl", args)
 
 
+def _launch_session_id(cwd, worker_type, epic_id, task_slug):
+    """Session naming: explicit ids win, else derive one from the project directory."""
+    if epic_id:
+        return f"{epic_id}-{worker_type}"
+    if task_slug:
+        return f"task-{task_slug}-{worker_type}"
+    return f"task-{os.path.basename(os.path.normpath(cwd))}-{worker_type}"
+
 def _pi_launch_impl(
-    worker_type,
-    skills,
     contract_path,
     cwd,
-    model,
+    worker_type="default",
+    skills=None,
+    model=None,
     epic_id=None,
     task_slug=None,
     mode="standard",
@@ -567,23 +599,24 @@ def _pi_launch_impl(
     cwd is the required absolute project dir: pi is project-scoped (skill
     discovery and relative paths resolve from it).
 
-    model is the required per-dispatch worker model alias; the plugin carries
-    no model names of its own, the caller's deployment defines the aliases.
+    model is an optional per-dispatch worker model alias; omitted, the command
+    carries no --model at all and pi uses its own defaultModel. The plugin
+    carries no model names of its own.
 
     session_id = <epic-id>-<worker-type> when epic_id given,
-                 task-<task_slug>-<worker-type> otherwise.
+                 task-<task_slug>-<worker-type> when task_slug given,
+                 task-<basename of cwd>-<worker-type> when neither: the same
+                 cwd with the same worker_type reuses that session id, and pi
+                 reuses the session state behind it.
 
     Non-empty skills -> returns "system_prompt" (compliance block) and the
-    command carries --append-system-prompt. Empty skills -> neither.
+    command carries --append-system-prompt. Missing/empty skills -> neither.
     """
     if worker_type not in WORKER_TYPES:
         return {"error": f"Unknown worker_type: {worker_type}. Valid: {list(WORKER_TYPES.keys())}"}
 
-    if not epic_id and not task_slug:
-        return {"error": "Either epic_id or task_slug is required (e.g. task_slug='lint-fix')"}
-
     cfg = WORKER_TYPES[worker_type]
-    session_id = f"{epic_id}-{worker_type}" if epic_id else f"task-{task_slug}-{worker_type}"
+    skills = list(skills or [])
     if mode == "legacy":
         return {
             "error": "legacy mode removed: it ran workers with -ns (skills "
@@ -595,6 +628,8 @@ def _pi_launch_impl(
 
     if not os.path.isfile(os.path.expanduser(contract_path)):
         return {"error": f"contract_path not found: {contract_path}"}
+
+    session_id = _launch_session_id(cwd, worker_type, epic_id, task_slug)
 
     warnings = []
     resolved_skills = []
@@ -625,13 +660,13 @@ def _pi_launch_impl(
     parts = [
         "python3",
         CLIENT_PATH,
-        "--model",
-        model,
         "--session-id",
         session_id,
         "--cwd",
         cwd,
     ]
+    if model:
+        parts.extend(["--model", model])
     # NOTE: no --ns anywhere: pi's -ns/--no-skills disables skill loading
     # outright, and every worker must run with its skills. Legacy mode is
     # rejected above.
