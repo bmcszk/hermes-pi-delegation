@@ -20,6 +20,8 @@ jobs:
           enable-cache: true
       - name: ruff
         run: uvx ruff check .
+      - name: ruff format
+        run: uvx ruff format --check .
       - name: pytest
         run: uv run --with pytest python -m pytest tests -q
       - name: byte-compile

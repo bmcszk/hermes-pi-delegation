@@ -36,6 +36,7 @@ for _name in (CODING_RULES, GO_DEV):
     with open(os.path.join(_name, "SKILL.md"), "w") as _f:
         _f.write(f"---\nname: {os.path.basename(_name)}\n---\ntest\n")
 
+
 @pytest.fixture(autouse=True)
 def isolated_home(monkeypatch, tmp_path):
     """Every test builds its own world: no test may read the machine's real HOME."""
@@ -45,6 +46,7 @@ def isolated_home(monkeypatch, tmp_path):
     monkeypatch.setattr(p, "WORKER_AGENT_DIR", str(agent_dir))
     monkeypatch.setattr(p, "REGISTRY_PATH", str(tmp_path / "pi-agents.jsonl"))
     return tmp_path
+
 
 @pytest.fixture
 def tmp_skill(tmp_path):
@@ -1032,6 +1034,7 @@ def test_launch_marks_model_required():
     assert "error" not in result, result
     assert "--model" not in shlex.split(result["command"])
 
+
 def test_launch_omits_model_flag_when_model_is_none():
     # given an explicit model=None
     payload = {
@@ -1050,6 +1053,7 @@ def test_launch_omits_model_flag_when_model_is_none():
     assert "error" not in result, result
     assert "--model" not in shlex.split(result["command"])
 
+
 def test_launch_explicit_model_still_wins():
     # given an explicit alias
     payload = {
@@ -1066,6 +1070,7 @@ def test_launch_explicit_model_still_wins():
 
     # then the alias lands on the worker argv
     assert parts[parts.index("--model") + 1] == "explicit-m"
+
 
 def test_launch_worker_type_defaults_to_default():
     # given a payload without worker_type
@@ -1088,6 +1093,7 @@ def test_launch_worker_type_defaults_to_default():
     assert "--codemode" not in parts
     assert "--thinking" not in parts
 
+
 def test_launch_unknown_worker_type_still_errors():
     # given a non-default unknown name
     payload = {
@@ -1104,6 +1110,7 @@ def test_launch_unknown_worker_type_still_errors():
     # then the passthrough default did not soften the unknown-name error
     assert "error" in result, result
     assert "nope" in result["error"]
+
 
 def test_launch_derives_session_id_from_cwd_when_epic_and_slug_missing():
     # given a payload with neither epic_id nor task_slug
@@ -1122,6 +1129,7 @@ def test_launch_derives_session_id_from_cwd_when_epic_and_slug_missing():
     expected = f"task-{os.path.basename(os.path.normpath(TMP_CWD))}-coder"
     assert result["session_id"] == expected
     assert expected in shlex.split(result["command"])
+
 
 def test_launch_explicit_session_ids_still_win():
     # when epic_id and task_slug are both present
@@ -1153,6 +1161,7 @@ def test_launch_explicit_session_ids_still_win():
     # then the explicit ids still name the session
     assert both["session_id"] == "epicWin-coder"
     assert slug_only["session_id"] == "task-slugWin-coder"
+
 
 def test_launch_schema_documents_model_param():
     # when
