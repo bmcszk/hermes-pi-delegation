@@ -1,108 +1,62 @@
 ---
 name: pi-delegation
-description: Delegate work to isolated pi workers with the pi-delegation plugin. Covers launch, wait, steer, kill, and salvage for any project and machine.
+description: "Use when dispatching work to a pi worker or controlling a running one with the pi-delegation plugin: launch a dispatch, wait for completion, detect a stalled worker, steer a live run, or salvage a dead one. Not for plugin installation or development; see the repo README."
 ---
 
 # Pi delegation
 
-One agent hires a pi worker. The worker edits code, runs tools, and reports.
-The plugin owns the handoff: `pi_launch` builds the dispatch command,
-`pi_manage` controls the running worker. This skill is the control loop.
-
-## Install
-
-1. Install the plugin into your agent runtime (Hermes, or any runtime that
-   loads it): the plugin lives in this repo at the repo root
-   (`__init__.py`, `plugin.yaml`, `scripts/`).
-2. Give workers an isolated agent dir. Every launch points pi at
-   `~/.pi/agent-worker`. It needs `settings.json`, and `auth.json` and
-   `models.json` symlinked from your main pi dir. See the plugin README.
-3. Install this skill for any agent that will dispatch workers:
-
-   ```
-   skills add bmcszk/hermes-pi-delegation
-   ```
+One agent hires a pi worker. `pi_launch` builds the dispatch command,
+`pi_manage` controls the running worker. Installation and setup live in the
+repo README; this skill is only the control loop.
 
 ## The loop
 
-```
-pi_launch -> run the echoed command verbatim (background) -> pi_manage wait
-```
+1. `pi_launch(contract_path, cwd, skills, require_edit=<exact file>)` returns
+   a one-line command. Run it verbatim in the background; never hand-write it.
+2. `pi_manage(action="wait", session_id=<id>)` blocks until the run settles.
+   Never sleep and poll.
+3. Verify the work on disk yourself: diff, gates, test counts. A completion
+   report is a claim, not a result.
 
-1. Call `pi_launch` with a contract file (the worker prompt), a `cwd`, and
-   `skills`. `require_edit` plus `min_tool_calls` arms the nudge gate.
-2. Run the echoed command through your terminal tool with `background=true`.
-   Never hand-write the command. Never re-type it from memory.
-3. Block on the run with `pi_manage(action="wait", session_id=<id>)`. Do not
-   sleep and poll. `wait` settles when the run ends.
-4. Verify the work on disk yourself: `git status`, gates, test counts. A
-   worker report is a claim, not a result.
+## Liveness
 
-## Watch liveness
+A hung tool call still trickles frames, so a worker can burn wall time while
+looking busy. `pi_manage(action="list", only_running=true)` reports
+`last_activity_s` per running worker: seconds since the client last framed.
+A large age with a live pid means stalled or silent. Kill it, read the tree
+on disk, relaunch fresh.
 
-A pi worker can hang forever while looking busy: a hung tool call still
-trickles progress frames, so the per-frame idle timeout never fires. The
-client stamps a heartbeat file on every frame (one write per 5 s).
+## Steer
 
-`pi_manage(action="list", only_running=true)` reports `last_activity_s` for
-each running worker. A large age with a live pid means the worker is stalled.
-When you find one: kill it, check the tree on disk, then relaunch.
+`pi_manage(action="steer", session_id=<id>, message="...")` injects guidance
+into the run in progress; `queue=true` holds it for the next turn. Verify
+the message landed by the worker's next output, never by the call itself.
 
-## Steer a live worker
+## Kill and salvage
 
-```
-pi_manage(action="steer", session_id=<id>, message="commit what you have")
-````
+`pi_manage(action="kill", session_id=<id>)` stops the client, the pi process,
+and all tool children in the process group. Prompting a stalled session
+again fails with "already processing": kill first, then relaunch on a fresh
+session id whose contract opens with the on-disk state.
 
-The message lands in the run in progress on the worker's next output frame.
-Add `queue=true` to hold it for the worker's next turn instead.
-Steering is fire-and-forget: verify by reading the worker's next output, not
-by the steer call itself.
-
-## Kill
-
-```
-pi_manage(action="kill", session_id=<id>)
-````
-
-Kill takes down the client, the pi process, and every tool child in the
-process group.光辉 Kill beats waiting: a same-session prompt into a stalled
-worker fails with "already processing". After a kill, relaunch on a FRESH
-session id whose contract opens with a state-on-disk section.
-
-## Salvage order
-
-After any exit (done, timeout, kill, exit 3), read the disk before the exit
-code:
-
-1. `git status --porcelain` and `git log` since the base.
-2. Green work-in-progress: gate it, commit it with the contract trailer.
-3. Red or half-done work: leave it in place and name the exact state in the
-   continuation contract. Killing without stashing destroys paid work.
-4. Exit 3 (nudge-capped) is salvage, not failure. Zero edits plus exit 0 is
-   the opposite trap: believe the tree, not the words.
+Salvage order after any exit: `git status` and `git log` since the base
+first, then gates. Green work in progress gets committed; red work stays in
+place with its exact state named in the continuation contract. Exit 3 is
+salvage, not failure. Exit 0 with zero edits is the opposite trap: believe
+the tree, not the words.
 
 ## Contract minimums
 
-- One deliverable per dispatch. Long features get chained slices.
+- One deliverable per dispatch; long work gets chained slices.
 - `require_edit` takes one exact file path, never a directory.
-- Put the contract's fingerprint line in the final commit body, so proof of
-  edit survives on the pushed branch.
-- Commit one unit at a time; partial progress must survive a timeout.
-- Keep every write call's payload small. One giant write dies mid-JSON and
-  repeats until the nudge budget is gone.
+- Commit one unit at a time so partial progress survives a timeout.
+- Keep each write payload small. One giant write dies mid-JSON and repeats
+  until the correction budget is gone.
 
-## Files the loop writes
+## State files
 
 | Path | Written by | Read by |
 | --- | --- | --- |
-| `~/.hermes/logs/pi-agents.jsonl` | client | `pi_manage` list/kill/wait |
-| `~/.hermes/logs/pi-heartbeat-<session>.json` | client | `pi_manage` list |
-| `~/.hermes/logs/pi-steer/<session>.json` | `pi_manage` steer | client |
-
-## Notes
-
-- Schema changes (new actions or parameters) need a runtime restart after
-  install; code changes hot-reload where the runtime supports it.
-- `pi_launch` accepts model aliases per dispatch and hardcodes none. Your
-  deployment owns the alias catalog.
+| `~/.hermes/logs/pi-agents.jsonl` | client | `list`, `kill`, `wait` |
+| `~/.hermes/logs/pi-heartbeat-<session>.json` | client | `list` |
+| `~/.hermes/logs/pi-steer/<session>.json` | `steer` | client |
