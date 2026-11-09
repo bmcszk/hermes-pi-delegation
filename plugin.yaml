@@ -1,8 +1,8 @@
 name: pi-delegation
-version: 2.2.0
+version: 2.3.0
 author: bmcszk
 url: https://github.com/bmcszk/hermes-pi-delegation
-description: "Mechanical enforcement of pi delegation laws: citations, comment safety, and git guardrails. Tools: pi_launch (schema derived from the impl signature, gate knobs, explicit timeout, optional model alias), pi_manage (list/kill/doctor/logs/wait)."
+description: "Mechanical enforcement of pi delegation laws: citations, comment safety, and git guardrails. Tools: pi_launch (schema derived from the impl signature, gate knobs, explicit timeout, optional model alias), pi_manage (list/kill/doctor/logs/wait/steer + heartbeat liveness)."
 provides_hooks:
   - pre_tool_call
 provides_tools:

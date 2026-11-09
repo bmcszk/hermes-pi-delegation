@@ -142,6 +142,65 @@ def _wait_finished(entry):
     return not (bool(pid) and _pid_alive(pid))
 
 
+def _steer_file(session_id):
+    """Control file for a live worker; client consumes it on the next frame.
+
+    Must match scripts/pi_rpc_client.py::_steer_file.
+    """
+    return os.path.join(os.path.dirname(REGISTRY_PATH), "pi-steer", f"{session_id}.json")
+
+
+def _heartbeat_age(session_id):
+    """Seconds since the worker last stamped its heartbeat file, or None.
+
+    Read side of the stamp the client writes (must match
+    scripts/pi_rpc_client.py::_heartbeat_file). A running pid with a large
+    age is a stalled or silent worker; the caller decides what to do.
+    """
+    path = os.path.join(os.path.dirname(REGISTRY_PATH), f"pi-heartbeat-{session_id}.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return round(time.time() - float(data.get("ts") or 0))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _steer_session(session_id, message, queue):
+    """Queue a steer/follow_up message for a live worker via its control file."""
+    if not session_id:
+        return {"error": "session_id required for steer"}
+    if not message:
+        return {"error": "message required for steer"}
+    entry = _newest_registry_entry(session_id)
+    if entry is None:
+        return {"error": f"Session {session_id} not found in registry"}
+    pid = entry.get("pid")
+    try:
+        os.kill(pid, 0)
+    except Exception:
+        _registry_update(session_id, pid, status="dead", finished=_now_iso())
+        return {"error": f"session {session_id} is not running (pid {pid} gone)"}
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read().decode("utf-8", "replace")
+        if "pi_rpc_client" not in cmdline:
+            return {"error": f"pid {pid} is not a pi_rpc_client process; refusing"}
+    except Exception:
+        return {"error": f"cannot verify cmdline of pid {pid}"}
+    path = _steer_file(session_id)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({"message": message, "queue": bool(queue), "ts": _now_iso()}, f)
+        os.replace(tmp, path)  # atomic: the client never reads a partial file
+    except OSError as exc:
+        return {"error": f"cannot write steer file: {exc}"}
+    kind = "follow_up" if queue else "steer"
+    return {"status": f"{kind} queued for {session_id}", "path": path}
+
+
 def _tool_schema(name, description, properties, required):
     """Build a JSON-schema dict for ctx.register_tool."""
     return {
@@ -311,10 +370,24 @@ def register(ctx):
         toolset=TOOLSETS["pi_manage"],
         schema=_tool_schema(
             "pi_manage",
-            "List or kill pi subagent sessions",
+            "List, steer or kill pi subagent sessions",
             {
-                "action": {"type": "string", "enum": ["list", "kill", "doctor", "logs", "wait"]},
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "kill", "doctor", "logs", "wait", "steer"],
+                },
                 "session_id": {"type": "string"},
+                "message": {
+                    "type": "string",
+                    "description": "steer: text injected into the worker",
+                },
+                "queue": {
+                    "type": "boolean",
+                    "description": (
+                        "steer: true queues the message for the worker's next turn "
+                        "(follow_up) instead of the current run"
+                    ),
+                },
                 "only_running": {"type": "boolean"},
                 "lines": {"type": "integer", "minimum": 1},
                 "timeout_s": {
@@ -388,8 +461,18 @@ def pi_manage(args: dict, **_):
 
 
 def _pi_manage_impl(
-    action, session_id=None, only_running=False, lines=40, timeout_s=None, poll_s=None, **_
+    action,
+    session_id=None,
+    only_running=False,
+    lines=40,
+    timeout_s=None,
+    poll_s=None,
+    message=None,
+    queue=False,
+    **_,
 ):
+    if action == "steer":
+        return _steer_session(session_id, message or "", queue)
     if action == "wait":
         if not session_id:
             return {"error": "session_id required for wait"}
@@ -409,6 +492,12 @@ def _pi_manage_impl(
             agents = [
                 e for e in agents if e.get("status") == "running" and _pid_alive(e.get("pid"))
             ]
+        for entry in agents:
+            if entry.get("status") != "running" or not _pid_alive(entry.get("pid")):
+                continue
+            age = _heartbeat_age(entry.get("session"))
+            if age is not None:
+                entry["last_activity_s"] = age
         agents.sort(key=lambda e: e.get("started", ""), reverse=True)
         return {"agents": agents}
 
