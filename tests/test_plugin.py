@@ -1482,3 +1482,202 @@ def test_pi_manage_wait_polls_until_dead():
         reaper.join(timeout=10)
         _teardown_registry()
         shutil.rmtree(tmpdir)
+
+
+class FakeClientProc:
+    """Alive decoy whose /proc cmdline names pi_rpc_client, like a real worker."""
+
+    def __init__(self) -> None:
+        self.proc = subprocess.Popen(
+            [sys.executable, "-c", "import time  # pi_rpc_client\nimport time; time.sleep(30)"]
+        )
+
+    def stop(self) -> None:
+        self.proc.terminate()
+        self.proc.wait(timeout=10)
+
+
+def test_pi_manage_steer_writes_control_file(tmpdir):
+    """steer targets a verified live pi_rpc_client process and writes the file."""
+    _setup_registry(tmpdir)
+    decoy = FakeClientProc()
+    try:
+        with open(p.REGISTRY_PATH, "w") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "session": "epicS-coder",
+                        "pid": decoy.proc.pid,
+                        "status": "running",
+                        "started": "2024-01-01T00:00:00",
+                    }
+                )
+                + "\n"
+            )
+        result = _parse(
+            p._pi_manage_impl(action="steer", session_id="epicS-coder", message="commit now")
+        )
+        steer_file = os.path.join(os.path.dirname(p.REGISTRY_PATH), "pi-steer", "epicS-coder.json")
+        with open(steer_file) as f:
+            payload = json.load(f)
+        assert payload["message"] == "commit now"
+        assert payload["queue"] is False
+        assert "steer queued" in result["status"], result
+    finally:
+        decoy.stop()
+        _teardown_registry()
+        shutil.rmtree(tmpdir)
+
+
+def test_pi_manage_steer_queue_true(tmpdir):
+    _setup_registry(tmpdir)
+    decoy = FakeClientProc()
+    try:
+        with open(p.REGISTRY_PATH, "w") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "session": "epicQ-coder",
+                        "pid": decoy.proc.pid,
+                        "status": "running",
+                        "started": "2024-01-01T00:00:00",
+                    }
+                )
+                + "\n"
+            )
+        result = _parse(
+            p._pi_manage_impl(
+                action="steer", session_id="epicQ-coder", message="skip that", queue=True
+            )
+        )
+        steer_file = os.path.join(os.path.dirname(p.REGISTRY_PATH), "pi-steer", "epicQ-coder.json")
+        with open(steer_file) as f:
+            payload = json.load(f)
+        assert payload["queue"] is True
+        assert "follow_up queued" in result["status"], result
+    finally:
+        decoy.stop()
+        _teardown_registry()
+        shutil.rmtree(tmpdir)
+
+
+def test_pi_manage_steer_refuses_missing_session(tmpdir):
+    _setup_registry(tmpdir)
+    try:
+        result = _parse(p._pi_manage_impl(action="steer", session_id="ghost-coder", message="hi"))
+        assert "error" in result, result
+        assert "not found in registry" in result["error"]
+    finally:
+        _teardown_registry()
+        shutil.rmtree(tmpdir)
+
+
+def test_pi_manage_steer_refuses_dead_pid(tmpdir):
+    _setup_registry(tmpdir)
+    try:
+        with open(p.REGISTRY_PATH, "w") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "session": "epicD-coder",
+                        "pid": 999999,
+                        "status": "running",
+                        "started": "2024-01-01T00:00:00",
+                    }
+                )
+                + "\n"
+            )
+        result = _parse(p._pi_manage_impl(action="steer", session_id="epicD-coder", message="hi"))
+        assert "error" in result, result
+        assert "not running" in result["error"]
+    finally:
+        _teardown_registry()
+        shutil.rmtree(tmpdir)
+
+
+def test_pi_manage_steer_refuses_non_client_pid(tmpdir):
+    """The decoy is alive but not a pi_rpc_client: steer refuses."""
+    _setup_registry(tmpdir)
+    decoy = subprocess.Popen(["sleep", "30"])
+    try:
+        with open(p.REGISTRY_PATH, "w") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "session": "epicN-coder",
+                        "pid": decoy.pid,
+                        "status": "running",
+                        "started": "2024-01-01T00:00:00",
+                    }
+                )
+                + "\n"
+            )
+        result = _parse(p._pi_manage_impl(action="steer", session_id="epicN-coder", message="hi"))
+        assert "error" in result, result
+        assert "pi_rpc_client" in result["error"]
+    finally:
+        decoy.terminate()
+        decoy.wait(timeout=10)
+        _teardown_registry()
+        shutil.rmtree(tmpdir)
+
+
+def test_pi_manage_steer_requires_message(tmpdir):
+    _setup_registry(tmpdir)
+    try:
+        result = _parse(p._pi_manage_impl(action="steer", session_id="epicX-coder"))
+        assert "error" in result, result
+        assert "message required" in result["error"]
+    finally:
+        _teardown_registry()
+        shutil.rmtree(tmpdir)
+
+
+def test_pi_manage_list_reports_heartbeat_age(tmpdir):
+    """Running agents get last_activity_s from the client's heartbeat stamp."""
+    import time as time_mod
+
+    _setup_registry(tmpdir)
+    decoy = subprocess.Popen(["sleep", "30"])
+    try:
+        with open(p.REGISTRY_PATH, "w") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "session": "epicH-coder",
+                        "pid": decoy.pid,  # list only checks liveness
+                        "status": "running",
+                        "started": "2024-01-01T00:00:00",
+                    }
+                )
+                + "\n"
+            )
+        heartbeat = os.path.join(os.path.dirname(p.REGISTRY_PATH), "pi-heartbeat-epicH-coder.json")
+        with open(heartbeat, "w") as f:
+            json.dump({"ts": time_mod.time() - 120, "frames": 5, "tools": 2}, f)
+
+        agents = _parse(p._pi_manage_impl(action="list"))["agents"]
+        entry = next(a for a in agents if a["session"] == "epicH-coder")
+        assert entry["last_activity_s"] >= 119, entry
+
+        # finished agents never carry the stamp
+        with open(p.REGISTRY_PATH, "w") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "session": "epicH2-coder",
+                        "pid": decoy.pid,
+                        "status": "done",
+                        "started": "2024-01-01T00:00:00",
+                    }
+                )
+                + "\n"
+            )
+        agents = _parse(p._pi_manage_impl(action="list"))["agents"]
+        done_entry = next(a for a in agents if a["session"] == "epicH2-coder")
+        assert "last_activity_s" not in done_entry, done_entry
+    finally:
+        decoy.terminate()
+        decoy.wait(timeout=10)
+        _teardown_registry()
+        shutil.rmtree(tmpdir)

@@ -1,6 +1,6 @@
 [project]
 name = "hermes-pi-delegation"
-version = "2.2.0"
+version = "2.3.0"
 description = "Hermes plugin: delegate work to isolated pi workers over pi RPC mode"
 authors = [{ name = "bmcszk", email = "dzikun@gmail.com" }]
 readme = "README.md"

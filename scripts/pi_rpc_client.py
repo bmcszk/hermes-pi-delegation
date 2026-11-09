@@ -46,6 +46,43 @@ REGISTRY_PATH = os.path.join(os.path.expanduser("~"), ".hermes", "logs", "pi-age
 WALL_TIMEOUT_S = float(os.environ.get("PI_WORKER_WALL_TIMEOUT_S", "3600"))
 
 
+# Both live under the registry dir so test setups that monkeypatch
+# REGISTRY_PATH relocate them for free.
+def _steer_file(session_id):
+    """Control file pi_manage(action="steer") writes; the client consumes it."""
+    if not session_id:
+        return None
+    return os.path.join(os.path.dirname(REGISTRY_PATH), "pi-steer", f"{session_id}.json")
+
+
+def _heartbeat_file(session_id):
+    """Liveness stamp the parent reads through pi_manage list as last_activity_s."""
+    if not session_id:
+        return None
+    return os.path.join(os.path.dirname(REGISTRY_PATH), f"pi-heartbeat-{session_id}.json")
+
+
+def _take_steer(session_id):
+    """Read one queued steer message and delete its file; None when absent.
+
+    A parse failure leaves the file in place and returns None, so a message
+    written while the file was mid-rename is consumed next frame instead of
+    lost. Rename-on-write keeps the race window closed on the writer side.
+    """
+    path = _steer_file(session_id)
+    if not path:
+        return None
+    try:
+        with open(path) as f:
+            msg = json.load(f)
+        os.remove(path)
+        if isinstance(msg, dict):
+            return msg
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def _registry_write(session_id, model, status, pid=None):
     """Append/update the agent registry line. Never raises, never blocks dispatch."""
     try:
@@ -165,6 +202,10 @@ class PiRpcClient:
         self._tool_ids: set = set()
         self.nudges = 0
         self.satisfied = True
+        self.steered: list[str] = []
+        self._frames_seen = 0
+        self._last_beat = 0.0
+        self._send_lock = threading.Lock()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -231,6 +272,9 @@ class PiRpcClient:
                 if frame.get("type") == "ready" or frame.get("type") == "extension_ui_request":
                     self._ready.set()
                 self._frames.put(frame)
+                self._frames_seen += 1
+                self._drain_steer()
+                self._heartbeat_tick()
 
     # -- protocol ----------------------------------------------------------
 
@@ -251,11 +295,50 @@ class PiRpcClient:
             pass
 
     def _send(self, frame: dict) -> None:
-        assert self.proc is not None
-        stdin = self.proc.stdin
-        assert stdin is not None
-        stdin.write(json.dumps(frame).encode("utf-8") + b"\n")
-        stdin.flush()
+        # pi_manage steer injections arrive on the reader thread while the
+        # main thread may be mid-nudge; both write proc.stdin.
+        with self._send_lock:
+            assert self.proc is not None
+            stdin = self.proc.stdin
+            assert stdin is not None
+            stdin.write(json.dumps(frame).encode("utf-8") + b"\n")
+            stdin.flush()
+
+    def _drain_steer(self) -> None:
+        """Inject one pi_manage-steered message into the live run.
+
+        Best-effort: a failed send still consumed the file, which is fine for
+        a fire-and-forget channel whose next verification is the worker's own
+        output. Lands when the next frame arrives; a fully silent worker
+        picks it up on its first output.
+        """
+        msg = _take_steer(self.session_id)
+        if not msg:
+            return
+        kind = "follow_up" if msg.get("queue") else "steer"
+        text = str(msg.get("message") or "")
+        try:
+            self._send({"type": kind, "message": text})
+            self.steered.append(text)
+        except Exception:
+            pass
+
+    def _heartbeat_tick(self, force: bool = False) -> None:
+        """Stamp liveness for pi_manage list; one write per 5 s at most."""
+        path = _heartbeat_file(self.session_id)
+        if not path:
+            return
+        now = time.time()
+        if not force and now - self._last_beat < 5.0:
+            return
+        self._last_beat = now
+        try:
+            with open(path, "w") as f:
+                json.dump(
+                    {"ts": now, "frames": self._frames_seen, "tools": len(self.tool_calls)}, f
+                )
+        except OSError:
+            pass
 
     def prompt(
         self,
@@ -599,6 +682,11 @@ def main(argv: list[str] | None = None) -> int:
         no_session=args.no_session,
         agent_dir=args.agent_dir,
     )
+    stale_steer = _steer_file(args.session_id)
+    if stale_steer:
+        # a fresh dispatch must not inherit a steer message aimed at a dead run
+        with contextlib.suppress(OSError):
+            os.remove(stale_steer)
     client.start()
     _registry_write(args.session_id or "unnamed", args.model, "running")
     status = "done"
@@ -613,9 +701,10 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(text)
         if not text.endswith("\n"):
             sys.stdout.write("\n")
+        steered_note = f" steered={len(client.steered)}" if client.steered else ""
         sys.stderr.write(
             f"[pi] tool_calls={len(client.tool_calls)} nudges={client.nudges} "
-            f"satisfied={client.satisfied}\n"
+            f"satisfied={client.satisfied}{steered_note}\n"
         )
         if not client.satisfied:
             status = "incomplete"

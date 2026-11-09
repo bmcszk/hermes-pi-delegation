@@ -48,11 +48,12 @@ Registry and process control for running workers.
 
 | Action | Meaning |
 | --- | --- |
-| `list` | Live and finished dispatches from the registry. |
+| `list` | Live and finished dispatches from the registry. Running agents carry `last_activity_s`: seconds since the client's last frame. A large age with a live pid is a stalled or silent worker. |
 | `kill` | Kill a dispatch by `session_id`. Own process group, so tool children die too. |
 | `doctor` | Report plugin freshness and schema parity between the registered schema and the implementation signature. |
 | `logs` | Tail the newest pi session log for a `session_id`. |
 | `wait` | Probe the registry until a `session_id` settles or `timeout_s` elapses. |
+| `steer` | Inject a message into a live worker's current run, or queue it for the next turn with `queue=true`. Landing is confirmed by the worker's next output, not the call. |
 
 ### Worker isolation directory
 
@@ -78,6 +79,16 @@ hermes plugins install bmcszk/hermes-pi-delegation
 The plugin has no runtime dependencies. It needs `pi` on `PATH`, or under a
 per-user install root (`~/.nvm/versions/node/*/bin`, `~/.npm-global/bin`,
 `~/.local/bin`, `~/.bun/bin`).
+
+## Companion skill
+
+The repo ships an installable skill that teaches any agent the delegation
+loop: launch, wait, steer, kill, salvage. `skills/pi-delegation/SKILL.md`
+installs with the skills CLI:
+
+```sh
+skills add bmcszk/hermes-pi-delegation
+```
 
 ## Development
 

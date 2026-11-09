@@ -4,6 +4,7 @@ import json
 import shutil
 import signal
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -442,3 +443,103 @@ class TestPiBinaryDiscovery:
 
         with pytest.raises(FileNotFoundError, match="pi binary not found"):
             _find_pi_binary()
+
+
+class TestSteerFile:
+    """pi_manage steer writes a control file; the client consumes it per frame."""
+
+    def _session(self, tmp_path, monkeypatch):
+        import pi_rpc_client as mod
+
+        monkeypatch.setattr(mod, "REGISTRY_PATH", str(tmp_path / "pi-agents.jsonl"))
+        client, fake = make_client(scripted_lines("x"))
+        client.session_id = "sess-steer"
+        return client, fake
+
+    def test_drain_sends_steering_frame(self, tmp_path, monkeypatch):
+        client, fake = self._session(tmp_path, monkeypatch)
+        steer_dir = tmp_path / "pi-steer"
+        steer_dir.mkdir()
+        msg = {"message": "commit what you have", "queue": False, "ts": "now"}
+        (steer_dir / "sess-steer.json").write_text(json.dumps(msg))
+
+        client._drain_steer()
+
+        assert json.loads(fake.stdin.written) == {
+            "type": "steer",
+            "message": "commit what you have",
+        }
+        assert client.steered == ["commit what you have"]
+        assert not (steer_dir / "sess-steer.json").exists()  # consumed exactly once
+
+    def test_drain_queue_true_sends_follow_up(self, tmp_path, monkeypatch):
+        client, fake = self._session(tmp_path, monkeypatch)
+        steer_dir = tmp_path / "pi-steer"
+        steer_dir.mkdir()
+        (steer_dir / "sess-steer.json").write_text(
+            json.dumps({"message": "skip that test", "queue": True, "ts": "now"})
+        )
+
+        client._drain_steer()
+
+        assert json.loads(fake.stdin.written) == {"type": "follow_up", "message": "skip that test"}
+
+    def test_drain_without_file_is_noop(self, tmp_path, monkeypatch):
+        client, fake = self._session(tmp_path, monkeypatch)
+        client._drain_steer()  # tmp_path never gets a pi-steer dir
+        assert fake.stdin.written == b""
+        assert client.steered == []
+
+    def test_no_session_skips_drain(self, tmp_path, monkeypatch):
+        client, fake = self._session(tmp_path, monkeypatch)
+        client.session_id = None
+        client._drain_steer()
+        assert fake.stdin.written == b""
+
+
+class TestHeartbeat:
+    def _session(self, tmp_path, monkeypatch):
+        import pi_rpc_client as mod
+
+        monkeypatch.setattr(mod, "REGISTRY_PATH", str(tmp_path / "pi-agents.jsonl"))
+        client, fake = make_client(scripted_lines("x"))
+        client.session_id = "sess-beat"
+        return client
+
+    def test_force_write_stamps_frames_and_tools(self, tmp_path, monkeypatch):
+        client = self._session(tmp_path, monkeypatch)
+        client.tool_calls = ["bash"]
+        client._frames_seen = 7
+
+        client._heartbeat_tick(force=True)
+
+        data = json.loads((tmp_path / "pi-heartbeat-sess-beat.json").read_text())
+        assert data["frames"] == 7
+        assert data["tools"] == 1
+        assert abs(time.time() - data["ts"]) < 5
+
+    def test_throttle_skips_within_window(self, tmp_path, monkeypatch):
+        client = self._session(tmp_path, monkeypatch)
+        client._frames_seen = 0  # start() already consumed the scripted frames
+        client._heartbeat_tick(force=True)
+        client._frames_seen = 99
+        client._heartbeat_tick()  # inside the 5 s window: must not rewrite
+
+        data = json.loads((tmp_path / "pi-heartbeat-sess-beat.json").read_text())
+        assert data["frames"] == 0  # first write's zero, not 99
+
+    def test_force_bypasses_throttle(self, tmp_path, monkeypatch):
+        client = self._session(tmp_path, monkeypatch)
+        client._frames_seen = 0
+        client._heartbeat_tick(force=True)
+        client._frames_seen = 99
+        client._heartbeat_tick(force=True)
+
+        data = json.loads((tmp_path / "pi-heartbeat-sess-beat.json").read_text())
+        assert data["frames"] == 99
+
+    def test_without_session_writes_nothing(self, tmp_path, monkeypatch):
+        client = self._session(tmp_path, monkeypatch)
+        client.session_id = None
+        client._heartbeat_tick(force=True)
+        assert not list(tmp_path.glob("pi-heartbeat-*"))
