@@ -147,3 +147,5 @@ API:
 ## License
 
 MIT, copyright 2026 bmcszk. See `LICENSE`.
+
+<!-- ci-trigger -->
