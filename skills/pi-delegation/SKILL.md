@@ -31,10 +31,12 @@ repo README; this skill is only the control loop.
    then exits 3). `epic_id` and `task_slug` name the session; run one
    worker per project at a time.
 3. `pi_manage(action="wait", session_id=<id>)` blocks until the registry
-   line is terminal and the pid is gone. Never sleep and poll. `wait` can
-   answer `finished: false` with `status: unknown` while the worker is
-   alive; treat that as no signal and re-check via `list` `last_activity_s`
-   once the registry line lands, or wait on the client process itself.
+   line is terminal and the pid is gone. Never sleep and poll. `wait`
+   answers `finished: false` with `status: unknown` only when the registry
+   holds no rows for the session at that probe (a fresh dispatch in its
+   first seconds); registered workers get a derived running or terminal
+   status. On an unknown, re-check via `list` `last_activity_s` once the
+   registry line lands, or wait on the client process itself.
 4. Verify the work on disk yourself: diff, gates, test counts. A completion
    report is a claim, not a result.
 
