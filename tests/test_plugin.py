@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 
 import pytest
@@ -1583,6 +1584,146 @@ def test_pi_manage_wait_polls_until_dead():
         assert p._pid_alive(child.pid) is False, result
     finally:
         reaper.join(timeout=10)
+        _teardown_registry()
+        shutil.rmtree(tmpdir)
+
+
+def test_pi_manage_wait_unknown_only_when_session_absent():
+    """unknown is reserved for a session with no registry rows at all."""
+    tmpdir = tempfile.mkdtemp()
+    _setup_registry(tmpdir)
+    try:
+        _write_registry(
+            {
+                "session": "otherSession-coder",
+                "pid": os.getpid(),
+                "status": "running",
+                "started": "2024-01-01T00:00:00",
+            }
+        )
+        result = _parse(pi_manage({"action": "wait", "session_id": "ghostSession-coder"}))
+        assert result["finished"] is False and result["status"] == "unknown", result
+    finally:
+        _teardown_registry()
+        shutil.rmtree(tmpdir)
+
+
+def test_pi_manage_wait_running_entry_reports_running_not_unknown():
+    """A registered live worker answers running with pid and heartbeat age."""
+    tmpdir = tempfile.mkdtemp()
+    _setup_registry(tmpdir)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        _write_registry(
+            {
+                "session": "epicLive-coder",
+                "pid": child.pid,
+                "status": "running",
+                "started": "2024-01-01T00:00:00",
+            }
+        )
+        heartbeat = os.path.join(
+            os.path.dirname(p.REGISTRY_PATH), "pi-heartbeat-epicLive-coder.json"
+        )
+        with open(heartbeat, "w") as f:
+            json.dump({"ts": time.time(), "frames": 3, "tools": 1}, f)
+        result = _parse(pi_manage({"action": "wait", "session_id": "epicLive-coder"}))
+        assert result["finished"] is False, result
+        assert result["status"] == "running", result
+        assert result["pid"] == child.pid, result
+        assert isinstance(result.get("last_activity_s"), int), result
+        assert "unknown" not in json.dumps(result), result
+    finally:
+        child.terminate()
+        child.wait(timeout=10)
+        _teardown_registry()
+        shutil.rmtree(tmpdir)
+
+
+FAKE_PI_SH = """#!/bin/sh
+echo '{"type":"ready"}'
+exec sleep 5
+"""
+
+
+def _spawn_real_client(tmpdir, session_id):
+    """Spawn the real scripts/pi_rpc_client.py against a fake sleeping pi."""
+    bin_dir = os.path.join(tmpdir, "bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    fake_pi = os.path.join(bin_dir, "pi")
+    with open(fake_pi, "w") as f:
+        f.write(FAKE_PI_SH)
+    os.chmod(fake_pi, 0o755)
+    env = {
+        **os.environ,
+        "HOME": tmpdir,
+        "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+    }
+    env["PYTHONPATH"] = os.pathsep.join(
+        [
+            os.path.dirname(os.path.abspath(__file__)),
+            os.path.dirname(p.CLIENT_PATH),
+            env.get("PYTHONPATH", ""),
+        ]
+    )
+    return subprocess.Popen(
+        [
+            sys.executable,
+            os.path.join(os.path.dirname(p.CLIENT_PATH), "pi_rpc_client.py"),
+            "--session-id",
+            session_id,
+            "--model",
+            "m",
+            "--prompt",
+            "p",
+            "--timeout",
+            "60",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    )
+
+
+def test_pi_manage_wait_live_client_running_then_sigterm_143():
+    """Real client subprocess: wait says running while its pid lives; after
+    SIGTERM it finishes killed with exit_code 143. Never unknown. The fake pi
+    emits one frame then sleeps, so last_activity_s is not guaranteed here
+    (a running worker's first heartbeat tick can land before its logs dir
+    exists) — the age field itself is covered by
+    test_pi_manage_wait_running_entry_reports_running_not_unknown.
+    """
+    tmpdir = tempfile.mkdtemp()
+    _setup_registry(tmpdir)
+    p.REGISTRY_PATH = os.path.join(tmpdir, ".hermes", "logs", "pi-agents.jsonl")
+    child = _spawn_real_client(tmpdir, "epicReal-coder")
+    try:
+        deadline = time.time() + 10
+        saw_running_row = False
+        while time.time() < deadline:
+            if os.path.exists(p.REGISTRY_PATH):
+                with open(p.REGISTRY_PATH) as f:
+                    if "running" in f.read():
+                        saw_running_row = True
+                        break
+            time.sleep(0.05)
+        assert saw_running_row, "client never wrote its running row"
+
+        running = _parse(pi_manage({"action": "wait", "session_id": "epicReal-coder"}))
+        assert running["finished"] is False, running
+        assert running["status"] == "running", running
+        assert running["pid"] == child.pid, running
+
+        child.terminate()
+        assert child.wait(timeout=10) == 143
+        finished = _parse(pi_manage({"action": "wait", "session_id": "epicReal-coder"}))
+        assert finished["finished"] is True, finished
+        assert finished["status"] == "killed", finished
+        assert finished["exit_code"] == 143, finished
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            child.wait(timeout=10)
         _teardown_registry()
         shutil.rmtree(tmpdir)
 

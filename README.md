@@ -52,7 +52,7 @@ Registry and process control for running workers.
 | `kill` | Kill a dispatch by `session_id`. Own process group, so tool children die too. |
 | `doctor` | Report plugin freshness and schema parity between the registered schema and the implementation signature. |
 | `logs` | Tail the newest pi session log for a `session_id`. |
-| `wait` | Probe the registry until a `session_id` settles or `timeout_s` elapses. |
+| `wait` | Probe the registry until a `session_id` settles or `timeout_s` elapses. `unknown` means no registry entry for the session at all; a registered session always answers `running` (with `pid`, plus `last_activity_s` when a heartbeat age is available) or terminal (with the registry status and `exit_code` when the row carries one) — even when a whole-file registry rewrite is mid-flight, so a healthy worker is never mistaken for an unknown one. |
 | `steer` | Inject a message into a live worker's current run, or queue it for the next turn with `queue=true`. Landing is confirmed by the worker's next output, not the call. |
 
 ### Notifications and exit codes

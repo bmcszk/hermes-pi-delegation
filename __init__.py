@@ -478,8 +478,6 @@ def _pi_manage_impl(
             return {"error": "session_id required for wait"}
         budget = max(0, int(timeout_s or 0))
         poll = max(1, int(poll_s or 1))
-        if _newest_registry_entry(session_id) is None:
-            return {"finished": False, "status": "unknown"}
         return _wait_for_completion(session_id, budget, poll)
     if action == "doctor":
         return _doctor()
@@ -536,19 +534,42 @@ def _pi_manage_impl(
         return {"error": f"Session {session_id} not found in registry"}
 
 
+def _wait_result(session_id, entry):
+    """Derived wait answer for one registry row: running/terminal/last_activity_s.
+
+    unknown is reserved for a session with no registry rows at all; a known
+    row always yields its derived fields, even when a concurrent whole-file
+    rewrite makes one read land partial.
+    """
+    status = entry.get("status") or "running"
+    pid = entry.get("pid")
+    result = {"finished": _wait_finished(entry), "status": status, "pid": pid}
+    if not result["finished"] and _pid_alive(pid):
+        age = _heartbeat_age(session_id)
+        if age is not None:
+            result["last_activity_s"] = age
+    if entry.get("exit_code") is not None:
+        result["exit_code"] = entry["exit_code"]
+    return result
+
+
 def _wait_for_completion(session_id, budget, poll):
-    """Probe the registry until the session settles or the budget runs out."""
+    """Probe the registry until the session settles or the budget runs out.
+
+    Never answers unknown for a registered session: unknown comes only from
+    the caller-side probe (no registry rows for this session at all), never
+    from inside the loop.
+    """
     deadline = time.monotonic() + budget
     while True:
         entry = _newest_registry_entry(session_id)
         if entry is None:
-            return {"finished": False, "status": "unknown"}
-        status = entry.get("status") or "running"
-        pid = entry.get("pid")
-        result = {"finished": _wait_finished(entry), "status": status, "pid": pid}
+            if time.monotonic() >= deadline:
+                return {"finished": False, "status": "unknown"}
+            time.sleep(poll)
+            continue
+        result = _wait_result(session_id, entry)
         if result["finished"] or deadline - time.monotonic() < poll:
-            if entry.get("exit_code") is not None:
-                result["exit_code"] = entry["exit_code"]
             return result
         time.sleep(poll)
 
