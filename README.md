@@ -55,6 +55,23 @@ Registry and process control for running workers.
 | `wait` | Probe the registry until a `session_id` settles or `timeout_s` elapses. |
 | `steer` | Inject a message into a live worker's current run, or queue it for the next turn with `queue=true`. Landing is confirmed by the worker's next output, not the call. |
 
+### Notifications and exit codes
+
+Background notifications report the exit code of the **wrapper**, not of the
+worker. A trailing `; echo "TAG=$?"` always succeeds and masks the real code;
+end the wrapper with the code-preserving form instead:
+
+```sh
+rc=$?; echo "TAG=$rc"; exit $rc
+```
+
+The client also writes its true terminal status (`done`, `incomplete`,
+`timeout`, `killed`) plus `exit_code` into the registry, so the real outcome is
+readable regardless of the wrapper: `pi_manage` `list` and `wait` surface the
+terminal `exit_code` (`0` done, `3` incomplete, `143` SIGTERM). `pi_manage`
+`kill` stamps `exit_code: 143` itself, since the killed client never gets to
+write.
+
 ### Worker isolation directory
 
 Every dispatch points pi at `~/.pi/agent-worker` (`WORKER_AGENT_DIR`). The plugin

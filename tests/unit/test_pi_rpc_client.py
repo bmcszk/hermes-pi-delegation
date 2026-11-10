@@ -1,9 +1,11 @@
 """Tests for pi_rpc_client. No network, no model calls, no real pi process."""
 
 import json
+import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -418,6 +420,35 @@ class TestRegistryUpdate:
         assert rows[0]["status"] == "done"
         assert rows[0]["pid"] == 222
 
+    def test_terminal_line_carries_known_exit_code(self, tmp_path, monkeypatch):
+        mod = self._write_registry(tmp_path, monkeypatch, [])
+        mod._registry_write("S3", "m", "done", pid=333, exit_code=0)
+        with open(mod.REGISTRY_PATH) as f:
+            rows = [json.loads(line) for line in f]
+        assert rows[0]["exit_code"] == 0
+
+    def test_running_line_has_no_exit_code_by_default(self, tmp_path, monkeypatch):
+        mod = self._write_registry(tmp_path, monkeypatch, [])
+        mod._registry_write("S4", "m", "running", pid=444)
+        with open(mod.REGISTRY_PATH) as f:
+            rows = [json.loads(line) for line in f]
+        assert "exit_code" not in rows[0]
+
+    def test_terminal_without_code_stays_absent_no_null(self, tmp_path, monkeypatch):
+        mod = self._write_registry(tmp_path, monkeypatch, [])
+        mod._registry_write("S5", "m", "timeout", pid=555, exit_code=None)
+        with open(mod.REGISTRY_PATH) as f:
+            rows = [json.loads(line) for line in f]
+        assert "exit_code" not in rows[0]
+
+    def test_killed_exit_code_maps_sigterm_and_interrupt(self):
+        import pi_rpc_client as mod
+
+        assert mod._killed_exit_code(SystemExit(143)) == 143
+        assert mod._killed_exit_code(KeyboardInterrupt()) == 130
+        assert mod._killed_exit_code(RuntimeError("x")) is None
+        assert mod._killed_exit_code(SystemExit("128+15")) is None
+
 
 class TestPiBinaryDiscovery:
     """Binary discovery is machine-agnostic: PATH first, then per-user roots."""
@@ -543,3 +574,145 @@ class TestHeartbeat:
         client.session_id = None
         client._heartbeat_tick(force=True)
         assert not list(tmp_path.glob("pi-heartbeat-*"))
+
+
+def _terminal_registry_line(registry_path: Path, session_id: str) -> dict:
+    """Newest registry entry for session_id, or AssertionError with all rows."""
+    rows = [json.loads(line) for line in registry_path.read_text().splitlines() if line]
+    matches = [r for r in rows if r.get("session") == session_id]
+    assert matches, rows
+    return sorted(matches, key=lambda r: r["started"])[-1]
+
+
+FAKE_PI_SH = """#!/bin/sh
+echo '{"type":"ready"}'
+exec sleep 5
+"""
+
+
+class TestMainExitCode:
+    """main() end to end: the process return value and the registry's terminal exit_code."""
+
+    SESSION = "sess-exit"
+
+    def _fake_pi_on_path(self, tmp_path: Path) -> str:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        fake_pi = bin_dir / "pi"
+        fake_pi.write_text(FAKE_PI_SH)
+        fake_pi.chmod(0o755)
+        return str(bin_dir)
+
+    def _child(self, tmp_path: Path) -> tuple[list[str], dict, Path]:
+        # Run as a real script: only then does the __main__ block install the
+        # SIGTERM handler the production path uses. HOME pins the registry
+        # under tmp_path, so the subprocess never touches the machine's file.
+        env = {
+            **os.environ,
+            "HOME": str(tmp_path),
+            "PATH": f"{self._fake_pi_on_path(tmp_path)}:{os.environ.get('PATH', '')}",
+        }
+        argv = [
+            sys.executable,
+            str(SCRIPTS_DIR / "pi_rpc_client.py"),
+            "--session-id",
+            self.SESSION,
+            "--model",
+            "m",
+            "--prompt",
+            "p",
+            "--timeout",
+            "60",
+        ]
+        return argv, env, tmp_path / ".hermes" / "logs" / "pi-agents.jsonl"
+
+    def test_sigterm_midrun_registry_carries_143(self, tmp_path):
+        # given a client child blocked waiting for an agent_end that never comes
+        argv, env, registry = self._child(tmp_path)
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if registry.exists() and "running" in registry.read_text():
+                break
+            time.sleep(0.05)
+        assert registry.exists(), "child never wrote its running line"
+
+        # when the parent SIGTERMs the child mid-run
+        proc.terminate()
+        rc = proc.wait(timeout=10)
+
+        # then the child exits 143 and its terminal registry line says so
+        assert rc == 143, rc
+        entry = _terminal_registry_line(registry, self.SESSION)
+        assert entry["status"] == "killed"
+        assert entry["exit_code"] == 143
+
+    def test_done_run_registry_carries_0(self, tmp_path, monkeypatch):
+        # given main() driving the scripted fake pi whose run makes no tool calls
+        import pi_rpc_client as mod
+
+        monkeypatch.setattr(mod, "REGISTRY_PATH", str(tmp_path / "pi-agents.jsonl"))
+        real_init = mod.PiRpcClient.__init__
+
+        def fake_init(self, *a, **kw):
+            kw["proc_factory"] = lambda argv, **k: FakePiRpcProc(scripted_lines("ok"))
+            real_init(self, *a, **kw)
+
+        monkeypatch.setattr(mod.PiRpcClient, "__init__", fake_init)
+
+        # when the dispatch completes normally
+        rc = mod.main(
+            [
+                "--session-id",
+                self.SESSION,
+                "--model",
+                "m",
+                "--prompt",
+                "p",
+                "--timeout",
+                "30",
+                "--min-tool-calls",
+                "0",
+            ]
+        )
+
+        # then done exit 0 lands in both the return value and the registry
+        assert rc == 0
+        entry = _terminal_registry_line(tmp_path / "pi-agents.jsonl", self.SESSION)
+        assert entry["status"] == "done"
+        assert entry["exit_code"] == 0
+
+    def test_incomplete_run_registry_carries_3(self, tmp_path, monkeypatch):
+        # given min_tool_calls=1 while the scripted run makes zero tool calls
+        import pi_rpc_client as mod
+
+        monkeypatch.setattr(mod, "REGISTRY_PATH", str(tmp_path / "pi-agents.jsonl"))
+        real_init = mod.PiRpcClient.__init__
+
+        def fake_init(self, *a, **kw):
+            kw["proc_factory"] = lambda argv, **k: FakePiRpcProc(scripted_lines("ok"))
+            real_init(self, *a, **kw)
+
+        monkeypatch.setattr(mod.PiRpcClient, "__init__", fake_init)
+
+        # when the dispatch completes without work (nudges exhausted by max)
+        rc = mod.main(
+            [
+                "--session-id",
+                self.SESSION,
+                "--model",
+                "m",
+                "--prompt",
+                "p",
+                "--timeout",
+                "30",
+                "--max-nudges",
+                "0",
+            ]
+        )
+
+        # then the incomplete verdict is return 3 and registry exit_code 3
+        assert rc == 3
+        entry = _terminal_registry_line(tmp_path / "pi-agents.jsonl", self.SESSION)
+        assert entry["status"] == "incomplete"
+        assert entry["exit_code"] == 3

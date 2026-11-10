@@ -83,7 +83,16 @@ def _take_steer(session_id):
     return None
 
 
-def _registry_write(session_id, model, status, pid=None):
+def _killed_exit_code(exc):
+    """Client exit code for a killed run: SIGTERM 143 (SystemExit 128+signum),
+    KeyboardInterrupt 130 (128+SIGINT), unknown otherwise."""
+    if isinstance(exc, KeyboardInterrupt):
+        return 130
+    code = getattr(exc, "code", None)
+    return code if isinstance(code, int) else None
+
+
+def _registry_write(session_id, model, status, pid=None, exit_code=None):
     """Append/update the agent registry line. Never raises, never blocks dispatch."""
     try:
         import datetime
@@ -97,6 +106,8 @@ def _registry_write(session_id, model, status, pid=None):
             "status": status,
             "started": now,
         }
+        if exit_code is not None:
+            entry["exit_code"] = int(exit_code)
         if status in ("done", "error", "killed", "timeout"):
             entry["finished"] = now
             _registry_update_running(session_id, entry)
@@ -690,6 +701,7 @@ def main(argv: list[str] | None = None) -> int:
     client.start()
     _registry_write(args.session_id or "unnamed", args.model, "running")
     status = "done"
+    exit_code = 0
     try:
         text = client.run(
             args.prompt,
@@ -708,14 +720,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         if not client.satisfied:
             status = "incomplete"
+            exit_code = 3
     except TimeoutError:
         status = "timeout"
+        exit_code = None
         raise
-    except BaseException:  # SystemExit (SIGTERM), KeyboardInterrupt = killed
+    except BaseException as exc:  # SystemExit (SIGTERM), KeyboardInterrupt = killed
         status = "killed"
+        exit_code = _killed_exit_code(exc)
         raise
     finally:
-        _registry_write(args.session_id or "unnamed", args.model, status)
+        _registry_write(args.session_id or "unnamed", args.model, status, exit_code=exit_code)
         client.close()
     return 0 if status == "done" else 3
 

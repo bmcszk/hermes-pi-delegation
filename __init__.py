@@ -525,7 +525,9 @@ def _pi_manage_impl(
                 except Exception:
                     return {"error": f"cannot verify cmdline of pid {pid}"}
                 os.killpg(pid, signal.SIGTERM)  # client AND its pi + tool children
-                _registry_update(session_id, pid, status="killed", finished=_now_iso())
+                _registry_update(
+                    session_id, pid, status="killed", exit_code=143, finished=_now_iso()
+                )
                 return {"status": f"SIGTERM sent to pgid {pid} ({session_id})"}
         if seen_dead_pid is not None:
             return {
@@ -543,11 +545,11 @@ def _wait_for_completion(session_id, budget, poll):
             return {"finished": False, "status": "unknown"}
         status = entry.get("status") or "running"
         pid = entry.get("pid")
-        if _wait_finished(entry):
-            return {"finished": True, "status": status, "pid": pid}
-        remaining = deadline - time.monotonic()
-        if remaining < poll:
-            return {"finished": False, "status": status, "pid": pid}
+        result = {"finished": _wait_finished(entry), "status": status, "pid": pid}
+        if result["finished"] or deadline - time.monotonic() < poll:
+            if entry.get("exit_code") is not None:
+                result["exit_code"] = entry["exit_code"]
+            return result
         time.sleep(poll)
 
 

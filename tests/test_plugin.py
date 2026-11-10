@@ -734,6 +734,46 @@ def test_pi_manage_kill_dead_pid_reports_dead():
         shutil.rmtree(tmpdir)
 
 
+def test_pi_manage_kill_stamps_exit_code_143():
+    """kill SIGTERMs a real own-group client decoy and stamps exit_code 143.
+
+    The client never gets to write its own terminal line, so the kill action
+    must carry the code the client cannot report.
+    """
+    tmpdir = tempfile.mkdtemp()
+    _setup_registry(tmpdir)
+    decoy = subprocess.Popen(
+        [sys.executable, "-c", "import time  # pi_rpc_client\nimport time; time.sleep(30)"],
+        start_new_session=True,
+    )
+    try:
+        with open(p.REGISTRY_PATH, "w") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "session": "epic143-coder",
+                        "pid": decoy.pid,
+                        "status": "running",
+                        "started": "2024-01-01T00:00:00",
+                    }
+                )
+                + "\n"
+            )
+        result = _parse(pi_manage({"action": "kill", "session_id": "epic143-coder"}))
+        assert "SIGTERM sent" in result["status"], result
+        assert decoy.wait(timeout=10) != 0
+        with open(p.REGISTRY_PATH) as f:
+            entry = json.loads(f.readline())
+        assert entry["status"] == "killed", entry
+        assert entry["exit_code"] == 143, entry
+    finally:
+        if decoy.poll() is None:
+            decoy.terminate()
+            decoy.wait(timeout=10)
+        _teardown_registry()
+        shutil.rmtree(tmpdir)
+
+
 def test_pi_manage_list_only_running():
     tmpdir = tempfile.mkdtemp()
     _setup_registry(tmpdir)
@@ -1416,6 +1456,69 @@ def test_pi_manage_wait_terminal_pid_gone():
         assert writes == [], writes
     finally:
         p._registry_update = original_update
+        _teardown_registry()
+        shutil.rmtree(tmpdir)
+
+
+def test_pi_manage_wait_surfaces_exit_code():
+    """wait reports the client's true exit code when the terminal line carries one."""
+    tmpdir = tempfile.mkdtemp()
+    _setup_registry(tmpdir)
+    try:
+        _write_registry(
+            {
+                "session": "epicX143-coder",
+                "pid": 999999,
+                "status": "killed",
+                "exit_code": 143,
+                "started": "2024-01-01T00:00:00",
+            },
+            {
+                "session": "epicX0-coder",
+                "pid": 999999,
+                "status": "done",
+                "exit_code": 0,
+                "started": "2024-01-02T00:00:00",
+            },
+            {
+                "session": "epicXnone-coder",
+                "pid": 999999,
+                "status": "timeout",
+                "started": "2024-01-03T00:00:00",
+            },
+        )
+        killed = _parse(pi_manage({"action": "wait", "session_id": "epicX143-coder"}))
+        assert killed["finished"] is True and killed["status"] == "killed", killed
+        assert killed["exit_code"] == 143, killed
+        done = _parse(pi_manage({"action": "wait", "session_id": "epicX0-coder"}))
+        assert done["finished"] is True and done["status"] == "done", done
+        assert done["exit_code"] == 0, done
+        without = _parse(pi_manage({"action": "wait", "session_id": "epicXnone-coder"}))
+        assert without["finished"] is True and without["status"] == "timeout", without
+        assert "exit_code" not in without, without
+    finally:
+        _teardown_registry()
+        shutil.rmtree(tmpdir)
+
+
+def test_pi_manage_list_surfaces_exit_code():
+    """list passes terminal exit_code entries through to the agents payload."""
+    tmpdir = tempfile.mkdtemp()
+    _setup_registry(tmpdir)
+    try:
+        _write_registry(
+            {
+                "session": "epicL143-coder",
+                "pid": 999999,
+                "status": "killed",
+                "exit_code": 143,
+                "started": "2024-01-01T00:00:00",
+            }
+        )
+        agents = _parse(pi_manage({"action": "list"}))["agents"]
+        assert len(agents) == 1, agents
+        assert agents[0]["exit_code"] == 143, agents
+    finally:
         _teardown_registry()
         shutil.rmtree(tmpdir)
 
