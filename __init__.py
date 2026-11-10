@@ -216,6 +216,14 @@ def _tool_schema(name, description, properties, required):
 
 
 LAUNCH_PARAMS = {
+    "create_anchor": {
+        "type": "boolean",
+        "description": (
+            "require_edit paths that do not exist get created as append-only lane-log "
+            "anchors (header: '## <slug> lane log (append-only)') instead of failing "
+            "preflight"
+        ),
+    },
     "worker_type": {
         "type": "string",
         "description": (
@@ -806,6 +814,93 @@ def _launch_session_id(cwd, worker_type, epic_id, task_slug):
     return f"task-{os.path.basename(os.path.normpath(cwd))}-{worker_type}"
 
 
+def _anchor_header(path):
+    """Standard append-only lane-log header for a require_edit anchor."""
+    slug = os.path.splitext(os.path.basename(path))[0]
+    return f"## {slug} lane log (append-only)"
+
+
+def _preflight(
+    cwd,
+    contract_path,
+    require_edit,
+    create_anchor,
+    resolved_skills,
+    timeout_s,
+    wall_timeout_s,
+    min_tool_calls,
+    max_nudges,
+):
+    """Fail-fast contract and budget checks before a worker spawns.
+
+    Returns (create_anchor_ok, failures list). Every check names itself, so
+    the aggregated error lists ALL failed checks, not just the first.
+    """
+    failures = []
+
+    if not os.path.isfile(os.path.expanduser(contract_path)):
+        failures.append(f"contract - not found or unreadable: {contract_path}")
+
+    if require_edit:
+        targets = [require_edit] if isinstance(require_edit, str) else list(require_edit)
+        for anchor in targets:
+            if not anchor:
+                failures.append("require_edit anchors - empty path entry")
+                continue
+            anchored = anchor if os.path.isabs(anchor) else os.path.join(cwd, anchor)
+            if os.path.exists(anchored):
+                continue
+            if create_anchor:
+                try:
+                    with open(anchored, "w") as f:
+                        f.write(_anchor_header(anchored) + "\n")
+                except OSError as exc:
+                    failures.append(f"require_edit anchors - cannot create {anchor}: {exc}")
+            else:
+                failures.append(
+                    f"require_edit anchors - missing: {anchored} "
+                    "(exists-check; create_anchor=true to create it)"
+                )
+
+    for skill in resolved_skills:
+        if not os.path.isdir(skill):
+            failures.append(f"skills - not a directory: {skill}")
+        elif not os.path.isfile(os.path.join(skill, "SKILL.md")):
+            failures.append(f"skills - directory lacks SKILL.md: {skill}")
+
+    if (
+        wall_timeout_s is not None
+        and timeout_s is not None
+        and int(wall_timeout_s) <= int(timeout_s)
+    ):
+        failures.append(
+            f"budgets - wall_timeout_s ({wall_timeout_s}) must exceed timeout_s ({timeout_s})"
+        )
+    min_max_passed = min_tool_calls is not _UNSET or max_nudges is not _UNSET
+    min_calls = 0 if min_tool_calls is _UNSET else int(min_tool_calls or 0)
+    max_nudges = 0 if max_nudges is _UNSET else int(max_nudges or 0)
+    if max_nudges > 0 and min_calls < 1:
+        failures.append(
+            "budgets - min_tool_calls < 1 while max_nudges > 0: the nudge gate "
+            "cannot tell work from luck"
+        )
+    if min_max_passed and not require_edit:
+        failures.append(
+            "budgets - min_tool_calls/max_nudges set without require_edit: the gate has no aim"
+        )
+
+    if not (
+        os.path.isfile(os.path.join(cwd, ".beans.yml"))
+        or os.path.isfile(os.path.join(cwd, "AGENTS.md"))
+    ):
+        failures.append(
+            "cwd - right-repo guard: launch cwd has neither .beans.yml nor AGENTS.md at "
+            "its root; add one of them (e.g. AGENTS.md)"
+        )
+
+    return failures
+
+
 def _pi_launch_impl(
     contract_path,
     cwd,
@@ -820,6 +915,7 @@ def _pi_launch_impl(
     max_nudges=_UNSET,
     timeout_s=None,
     wall_timeout_s=None,
+    create_anchor=False,
     **_,
 ):
     """Generate a single-line POSIX shell command for pi_rpc_client.py.
@@ -857,13 +953,11 @@ def _pi_launch_impl(
     if not isinstance(cwd, str) or not os.path.isdir(cwd):
         return {"error": f"cwd must be an existing directory (absolute project dir), got: {cwd!r}"}
 
-    if not os.path.isfile(os.path.expanduser(contract_path)):
-        return {"error": f"contract_path not found: {contract_path}"}
-
     session_id = _launch_session_id(cwd, worker_type, epic_id, task_slug)
 
     warnings = []
     resolved_skills = []
+    preflight_skill_failures = []
     for skill in skills:
         expanded = os.path.expanduser(skill)
         if os.path.exists(expanded):
@@ -871,13 +965,14 @@ def _pi_launch_impl(
         else:
             found = _resolve_skill_name(skill, cwd)
             if found is None:
-                return {"error": f"skill not found: {skill}"}
+                preflight_skill_failures.append(f"skills - not resolved: {skill}")
+                continue
             resolved = found
         if not _skill_discoverable(resolved, cwd):
             warnings.append(
-                f"{skill} is outside pi skill discovery (.agents/.pi under cwd ancestors); "
-                "worker reads it only via the absolute path, so the contract must "
-                "quote this exact path"
+                f"preflight warn: {skill} is outside pi skill discovery "
+                "(.agents/.pi under cwd ancestors); worker reads it only via the absolute "
+                "path, so the contract must quote this exact path"
             )
         resolved_skills.append(resolved)
     skills = resolved_skills
@@ -885,6 +980,23 @@ def _pi_launch_impl(
     live_pid = _live_session(session_id)
     if live_pid is not None:
         return {"error": f"session {session_id} already running (pid {live_pid})"}
+
+    failures = (
+        _preflight(
+            cwd,
+            contract_path,
+            require_edit,
+            create_anchor,
+            resolved_skills,
+            timeout_s,
+            wall_timeout_s,
+            min_tool_calls,
+            max_nudges,
+        )
+        + preflight_skill_failures
+    )
+    if failures:
+        return {"error": "preflight: " + "; ".join(failures)}
 
     # Single-line POSIX command, shlex-quoted throughout. Double quotes around
     # $(cat ...) so command substitution happens at shell level.
@@ -944,9 +1056,10 @@ def _pi_launch_impl(
         # Wall must exceed the idle budget or long sweeps die mid-contract.
         resolved_wall = max(3600, resolved_timeout + 900)
     elif resolved_wall < resolved_timeout:
-        return {
-            "error": f"wall_timeout_s ({resolved_wall}) must be >= timeout_s ({resolved_timeout})"
-        }
+        failures = [
+            f"budgets - wall_timeout_s ({resolved_wall}) must be >= timeout_s ({resolved_timeout})"
+        ]
+        return {"error": "preflight: " + "; ".join(failures)}
     parts.extend(["--wall-timeout", str(resolved_wall)])
 
     if require_edit:
@@ -965,7 +1078,8 @@ def _pi_launch_impl(
         }
     parts.extend(["--prompt", f"$(cat {shlex.quote(contract_path)})"])
 
-    command = " ".join(shlex.quote(p) for p in parts[:-1])
+    command = "echo 'preflight ok: contract, require_edit anchors, skills, budgets, cwd' && "
+    command += " ".join(shlex.quote(p) for p in parts[:-1])
     # Last part keeps $(cat ...) unquoted at the outer level: shlex.quote would
     # suppress substitution, so emit it double-quoted manually.
     command += f' "$(cat {shlex.quote(contract_path)})"'

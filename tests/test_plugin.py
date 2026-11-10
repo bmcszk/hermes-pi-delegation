@@ -23,6 +23,8 @@ from __init__ import (
 )
 
 TMP_CWD = tempfile.mkdtemp(prefix="pi-delegation-test-cwd-")
+with open(os.path.join(TMP_CWD, "AGENTS.md"), "w") as _f:
+    _f.write("test repo marker\n")
 CONTRACT_MD = os.path.join(TMP_CWD, "contract.md")
 with open(CONTRACT_MD, "w") as _f:
     _f.write("test contract\n")
@@ -242,6 +244,7 @@ def test_pi_launch_resolves_bare_name_project_root(tmp_path, monkeypatch):
     # given the skill exists only under a project .agents/skills root
     proj = tmp_path / "proj"
     proj.mkdir()
+    (proj / "AGENTS.md").write_text("test repo marker\n")
     _write_skill(proj, ".agents/skills", "probe-widget-skill")
     monkeypatch.setenv("HOME", str(tmp_path))
     # when launching with the bare name
@@ -258,6 +261,7 @@ def test_pi_launch_resolves_bare_name_project_ancestor(tmp_path, monkeypatch):
     _write_skill(tmp_path, ".pi/skills", "probe-piskill-skill")
     sub = tmp_path / "proj" / "deep"
     sub.mkdir(parents=True)
+    (sub / "AGENTS.md").write_text("test repo marker\n")
     monkeypatch.setenv("HOME", str(tmp_path))
     # when launching from below that root
     result = _launch_with_skill("probe-piskill-skill", str(sub))
@@ -272,6 +276,7 @@ def test_pi_launch_resolves_bare_name_global_agents(tmp_path, monkeypatch):
     # given the skill exists only in the global agents root
     proj = tmp_path / "proj"
     proj.mkdir()
+    (proj / "AGENTS.md").write_text("test repo marker\n")
     _write_skill(tmp_path, ".agents/skills", "probe-agents-skill")
     monkeypatch.setenv("HOME", str(tmp_path))
     # when launching with the bare name
@@ -286,6 +291,7 @@ def test_pi_launch_resolves_bare_name_hermes_root_level(tmp_path, monkeypatch):
     # given the skill sits directly at the hermes skills root, no category dir
     proj = tmp_path / "proj"
     proj.mkdir()
+    (proj / "AGENTS.md").write_text("test repo marker\n")
     _write_skill(tmp_path, ".hermes/skills", "probe-root-skill")
     monkeypatch.setenv("HOME", str(tmp_path))
     # when launching with the bare name
@@ -301,6 +307,7 @@ def test_pi_launch_resolves_bare_name_hermes_local(tmp_path, monkeypatch):
     # given the skill exists only under a hermes skills category root
     proj = tmp_path / "proj"
     proj.mkdir()
+    (proj / "AGENTS.md").write_text("test repo marker\n")
     _write_skill(tmp_path, ".hermes/skills/dev", "probe-hermes-skill")
     monkeypatch.setenv("HOME", str(tmp_path))
     # when launching with the bare name
@@ -316,6 +323,7 @@ def test_pi_launch_bare_name_prefers_project_over_global(tmp_path, monkeypatch):
     # given the same probe name exists in the project root and the global agents root
     proj = tmp_path / "proj"
     proj.mkdir()
+    (proj / "AGENTS.md").write_text("test repo marker\n")
     _write_skill(proj, ".agents/skills", "probe-dup-skill")
     _write_skill(tmp_path, ".agents/skills", "probe-dup-skill")
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -331,6 +339,7 @@ def test_pi_launch_bare_name_prefers_global_agents_over_hermes(tmp_path, monkeyp
     # given the same probe name exists in the global agents root and hermes-local
     proj = tmp_path / "proj"
     proj.mkdir()
+    (proj / "AGENTS.md").write_text("test repo marker\n")
     _write_skill(tmp_path, ".agents/skills", "probe-dup-skill2")
     _write_skill(tmp_path, ".hermes/skills/dev", "probe-dup-skill2")
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -346,17 +355,20 @@ def test_pi_launch_rejects_unknown_bare_name(tmp_path, monkeypatch):
     # given no skill root contains the name
     proj = tmp_path / "proj"
     proj.mkdir()
+    (proj / "AGENTS.md").write_text("test repo marker\n")
     monkeypatch.setenv("HOME", str(tmp_path))
     # when launching with a bare name that exists nowhere
     result = _launch_with_skill("probe-not-anywhere-xyz", str(proj))
     # then the launch is refused with the same error shape as unknown paths
-    assert result.get("error") == "skill not found: probe-not-anywhere-xyz"
+    assert "preflight" in result.get("error", ""), result
+    assert "not resolved: probe-not-anywhere-xyz" in result["error"]
 
 
 def test_pi_launch_compliance_block_uses_resolved_paths(tmp_path, monkeypatch):
     # given a bare-name skill resolved from the global agents root
     proj = tmp_path / "proj"
     proj.mkdir()
+    (proj / "AGENTS.md").write_text("test repo marker\n")
     _write_skill(tmp_path, ".agents/skills", "probe-agents-skill")
     monkeypatch.setenv("HOME", str(tmp_path))
     # when launching
@@ -437,7 +449,13 @@ def test_generated_command_single_line_and_parseable():
         parts = [CONTRACT_MD if v.startswith("$(cat") else v for v in parts]
         assert "--session-id" in parts, wt
         assert "--prompt" in parts, wt
-        assert parts[0] == "python3", wt
+        # the emitted line starts with the preflight ok note, then the client
+        assert parts[0] == "echo", wt
+        assert parts[1].endswith(
+            "preflight ok: contract, require_edit anchors, skills, budgets, cwd"
+        ), wt
+        assert parts[2] == "&&", wt
+        assert parts[3] == "python3", wt
 
 
 def test_prompt_substitution_not_quoted_away():
@@ -956,7 +974,7 @@ def test_launch_rejects_missing_contract():
         )
     )
     assert "error" in result, result
-    assert "contract_path not found" in result["error"], result
+    assert "not found or unreadable" in result["error"], result
 
 
 def test_launch_rejects_missing_skill():
@@ -975,12 +993,12 @@ def test_launch_rejects_missing_skill():
         )
     )
     assert "error" in result, result
-    assert "skill not found: /nonexistent/skill" in result["error"], result
+    assert "skills - not resolved: /nonexistent/skill" in result["error"], result
 
 
 def test_launch_warns_hermes_local_skill(tmp_skill):
     """Existing skill outside .agents/.pi discovery -> warnings, command still built."""
-    skill = str(tmp_skill / "SKILL.md")
+    skill = str(tmp_skill)
     result = _parse(
         pi_launch(
             {
@@ -1004,11 +1022,13 @@ def test_launch_warns_hermes_local_skill(tmp_skill):
 def test_launch_no_warning_for_agents_skill():
     """Skill under <cwd>/.agents/skills -> no warnings."""
     proj = tempfile.mkdtemp(prefix="pi-delegation-test-proj-")
+    with open(os.path.join(proj, "AGENTS.md"), "w") as f:
+        f.write("test repo marker\n")
     skill_dir = os.path.join(proj, ".agents", "skills", "foo")
     os.makedirs(skill_dir)
-    skill = os.path.join(skill_dir, "SKILL.md")
-    with open(skill, "w") as f:
+    with open(os.path.join(skill_dir, "SKILL.md"), "w") as f:
         f.write("x\n")
+    skill = skill_dir
     result = _parse(
         pi_launch(
             {
@@ -1221,11 +1241,14 @@ def test_worker_types_carry_no_model_key():
 
 def test_launch_timeout_override():
     # given
+    _proj = tempfile.mkdtemp(prefix="pi-delegation-pf-")
+    with open(os.path.join(_proj, "AGENTS.md"), "w") as f:
+        f.write("test repo marker\n")
     base = dict(
         worker_type="coder",
         skills=[],
         contract_path=_contract_file(),
-        cwd=p.os.getcwd(),
+        cwd=_proj,
         model="anything",
         epic_id="test-epic",
     )
@@ -1241,11 +1264,14 @@ def test_launch_timeout_override():
 
 def test_launch_rejects_gates_without_require_edit():
     # given
+    _proj = tempfile.mkdtemp(prefix="pi-delegation-pf-")
+    with open(os.path.join(_proj, "AGENTS.md"), "w") as f:
+        f.write("test repo marker\n")
     base = dict(
         worker_type="coder",
         skills=[],
         contract_path=_contract_file(),
-        cwd=p.os.getcwd(),
+        cwd=_proj,
         model="anything",
         epic_id="test-epic",
     )
@@ -1259,18 +1285,22 @@ def test_launch_rejects_gates_without_require_edit():
 
 def test_launch_emits_default_gates_with_require_edit():
     # given
+    _proj = tempfile.mkdtemp(prefix="pi-delegation-pf-")
+    with open(os.path.join(_proj, "AGENTS.md"), "w") as f:
+        f.write("test repo marker\n")
+    with open(os.path.join(_proj, "a.go"), "w") as f:
+        f.write("package main\n")
     base = dict(
         worker_type="coder",
         skills=[],
         contract_path=_contract_file(),
-        cwd=p.os.getcwd(),
+        cwd=_proj,
         model="anything",
         epic_id="test-epic",
     )
 
     # when
     result = p._pi_launch_impl(**base, require_edit="a.go")
-
     # then
     assert "--min-tool-calls 3" in result["command"]
     assert "--max-nudges 4" in result["command"]
@@ -2344,3 +2374,214 @@ def test_salvage_report_unknown_session_error_unchanged(tmp_path):
         assert result["finished"] is False and result["status"] == "unknown", result
     finally:
         _teardown_registry()
+
+
+def _preflight_cwd(tmp_path, marker="AGENTS.md"):
+    """A launch cwd with one repo marker (beans/agents), a contract, an anchor."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "AGENTS.md").write_text("test repo marker\n")
+    (proj / marker).write_text("marker\n")
+    contract = proj / "contract.md"
+    contract.write_text("worker contract\n")
+    anchor = proj / "lane-log.md"
+    return proj, str(contract), str(anchor)
+
+
+def test_preflight_missing_require_edit_anchor_errors(tmp_path):
+    proj, contract, anchor = _preflight_cwd(tmp_path)
+    result = _parse(
+        pi_launch(
+            {
+                "worker_type": "coder",
+                "skills": [],
+                "contract_path": contract,
+                "cwd": str(proj),
+                "epic_id": "epicPre",
+                "require_edit": [anchor],
+            }
+        )
+    )
+    assert "error" in result, result
+    assert "preflight" in result["error"], result["error"]
+    assert anchor in result["error"], result["error"]
+
+
+def test_preflight_create_anchor_makes_file_with_header(tmp_path):
+    proj, contract, anchor = _preflight_cwd(tmp_path)
+    assert not os.path.exists(anchor)
+    result = _parse(
+        pi_launch(
+            {
+                "worker_type": "coder",
+                "skills": [],
+                "contract_path": contract,
+                "cwd": str(proj),
+                "epic_id": "epicAnchor",
+                "require_edit": [anchor],
+                "create_anchor": True,
+            }
+        )
+    )
+    assert "error" not in result, result
+    assert os.path.exists(anchor)
+    with open(anchor) as f:
+        first = f.readline().strip()
+    assert first == "## lane-log lane log (append-only)", first
+
+
+def test_preflight_accepts_relative_anchor_against_cwd(tmp_path):
+    proj, contract, _ = _preflight_cwd(tmp_path)
+    (proj / "rel.md").write_text("target\n")
+    result = _parse(
+        pi_launch(
+            {
+                "worker_type": "coder",
+                "skills": [],
+                "contract_path": contract,
+                "cwd": str(proj),
+                "epic_id": "epicRel",
+                "require_edit": ["rel.md"],
+            }
+        )
+    )
+    assert "error" not in result, result
+
+
+def test_preflight_missing_skill_path_errors(tmp_path):
+    proj, contract, _ = _preflight_cwd(tmp_path)
+    result = _parse(
+        pi_launch(
+            {
+                "worker_type": "coder",
+                "skills": [str(proj / "missing-skill")],
+                "contract_path": contract,
+                "cwd": str(proj),
+                "epic_id": "epicSkillPf",
+            }
+        )
+    )
+    assert "error" in result, result
+    assert "preflight" in result["error"], result["error"]
+
+
+def test_preflight_skill_root_without_skill_md_errors(tmp_path):
+    proj, contract, _ = _preflight_cwd(tmp_path)
+    bare = proj / "bare-skill"
+    bare.mkdir()
+    result = _parse(
+        pi_launch(
+            {
+                "worker_type": "coder",
+                "skills": [str(bare)],
+                "contract_path": contract,
+                "cwd": str(proj),
+                "epic_id": "epicSkillMd",
+            }
+        )
+    )
+    assert "error" in result, result
+    assert "SKILL.md" in result["error"], result["error"]
+
+
+def test_preflight_wall_timeout_below_idle_budget_errors(tmp_path):
+    proj, contract, _ = _preflight_cwd(tmp_path)
+    result = _parse(
+        pi_launch(
+            {
+                "worker_type": "coder",
+                "skills": [],
+                "contract_path": contract,
+                "cwd": str(proj),
+                "epic_id": "epicWall",
+                "timeout_s": 600,
+                "wall_timeout_s": 300,
+            }
+        )
+    )
+    assert "error" in result, result
+    assert "preflight" in result["error"], result["error"]
+
+
+def test_preflight_min_tool_calls_needs_positive_or_no_nudges(tmp_path):
+    proj, contract, _ = _preflight_cwd(tmp_path)
+    result = _parse(
+        pi_launch(
+            {
+                "worker_type": "coder",
+                "skills": [],
+                "contract_path": contract,
+                "cwd": str(proj),
+                "epic_id": "epicGate",
+                "require_edit": [str(proj / "anchored.md")],
+                "min_tool_calls": 0,
+                "max_nudges": 2,
+            }
+        )
+    )
+    assert "error" in result, result
+    assert "preflight" in result["error"], result["error"]
+
+
+def test_preflight_min_max_without_require_edit_errors(tmp_path):
+    proj, contract, _ = _preflight_cwd(tmp_path)
+    result = _parse(
+        pi_launch(
+            {
+                "worker_type": "coder",
+                "skills": [],
+                "contract_path": contract,
+                "cwd": str(proj),
+                "epic_id": "epicAim",
+                "min_tool_calls": 3,
+            }
+        )
+    )
+    assert "error" in result, result
+    assert "preflight" in result["error"], result["error"]
+
+
+def test_preflight_cwd_without_repo_markers_errors(tmp_path):
+    proj, contract, _ = _preflight_cwd(tmp_path)
+    (proj / "AGENTS.md").unlink()
+    result = _parse(
+        pi_launch(
+            {
+                "worker_type": "coder",
+                "skills": [],
+                "contract_path": contract,
+                "cwd": str(proj),
+                "epic_id": "epicMark",
+            }
+        )
+    )
+    assert "error" in result, result
+    assert "preflight" in result["error"], result["error"]
+    assert "AGENTS.md" in result["error"], result["error"]
+
+
+def test_preflight_happy_path_emits_ok_line(tmp_path):
+    proj, contract, anchor = _preflight_cwd(tmp_path)
+    (proj / "a.md").write_text("x")
+    result = _parse(
+        pi_launch(
+            {
+                "worker_type": "coder",
+                "skills": [],
+                "contract_path": contract,
+                "cwd": str(proj),
+                "epic_id": "epicHappy",
+                "require_edit": [str(proj / "a.md")],
+            }
+        )
+    )
+    assert "error" not in result, result
+    assert (
+        "preflight ok: contract, require_edit anchors, skills, budgets, cwd" in result["command"]
+    ), result["command"]
+
+
+def test_doctor_schema_missing_empty_with_create_anchor():
+    report = p._pi_manage_impl(action="doctor")
+    assert report["schema_missing"] == []
+    assert "create_anchor" in report["registered_props"], report["registered_props"]
