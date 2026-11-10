@@ -32,15 +32,30 @@ Generates one worker dispatch.
 | `timeout_s` | no | Idle budget per dispatch. Defaults to `PI_WORKER_TIMEOUT_S`, 900 s. |
 | `wall_timeout_s` | no | Hard ceiling on the whole dispatch. Defaults to `max(3600, timeout_s + 900)`. |
 
-Worker types carry tool policy only:
+Worker types carry tool policy; what each is FOR and what its deliverable is:
 
-| Worker type | Tools | codemode | thinking |
-| --- | --- | --- | --- |
-| `default` | pi defaults | no | pi default |
-| `reasoner` | `read,grep,find,ls` | no | high |
-| `brainer` | `read,grep,find,ls,write,edit` | no | high |
-| `coder` | pi defaults | yes | pi default |
-| `auditor` | pi defaults | yes | pi default |
+| Worker type | Purpose | Deliverable | Tools | codemode | thinking |
+| --- | --- | --- | --- | --- | --- |
+| `default` | passthrough dispatch | whatever the run's work produces | pi defaults | no | pi default |
+| `reasoner` | read-only analysis, opinions in the reply text | reply text | `read,grep,find,ls` | no | high |
+| `brainer` | light edits + short docs | edited files + reply text | `read,grep,find,ls,write,edit` | no | high |
+| `coder` | implementation work | edited files (nudge-gated) | pi defaults | yes | pi default |
+| `auditor` | review/triage jobs under the SAME registry and pi_manage surfaces (list, wait, kill, steer, logs via log_path, salvage_report) — runs as a real dispatch with a row, heartbeats and log_path. Go-to for text-deliverable jobs: the final assistant TEXT is the run's only observable output, so it is written into the first `require_edit` path at completion. The text lands on status done; a failed deliverable write downgrades to `incomplete` (exit 3). Full client-side tracking and management machinery work for it. | text written into the first `require_edit` path | `read,grep,find,ls,write,edit` | no | pi default |
+
+### One-shot dispatch (`auto=true`)
+
+`pi_launch` accepted `auto`: with it, the launcher runs the generated
+command itself as a DETACHED background process (its own process group —
+the kill path stays exact) and returns
+`{dispatched: true, pid, session_id, log}` where `log` is
+`<cwd>/.hermes/lane/<session_id>.log`, holding the worker's combined
+stdout+stderr (preflight + budget echoes included). The paste path
+(`auto=false`, the default) is unchanged: the command comes back as a
+string and NOTHING spawns. Preflight still runs FIRST either way — a
+preflight failure emits no process in both modes. Truth lives in the
+registry: `wait`/`list`/`kill` work on an auto-dispatched worker exactly
+like a pasted one, and the log file is the belt-and-suspenders view over
+`logs` (log_path).
 
 ### `pi_manage`
 
@@ -52,8 +67,54 @@ Registry and process control for running workers.
 | `kill` | Kill a dispatch by `session_id`. Own process group, so tool children die too. |
 | `doctor` | Report plugin freshness and schema parity between the registered schema and the implementation signature. |
 | `logs` | Tail the newest pi session log for a `session_id`. |
-| `wait` | Probe the registry until a `session_id` settles or `timeout_s` elapses. |
+| `wait` | Probe the registry until a `session_id` settles or `timeout_s` elapses. `unknown` means no registry entry for the session at all; a registered session always answers `running` (with `pid`, plus `last_activity_s` when a heartbeat age is available) or terminal (with the registry status and `exit_code` when the row carries one) — even when a whole-file registry rewrite is mid-flight, so a healthy worker is never mistaken for an unknown one. |
 | `steer` | Inject a message into a live worker's current run, or queue it for the next turn with `queue=true`. Landing is confirmed by the worker's next output, not the call. |
+
+### Notifications and exit codes
+
+Background notifications report the exit code of the **wrapper**, not of the
+worker. A trailing `; echo "TAG=$?"` always succeeds and masks the real code;
+end the wrapper with the code-preserving form instead:
+
+```sh
+rc=$?; echo "TAG=$rc"; exit $rc
+```
+
+The client also writes its true terminal status (`done`, `incomplete`,
+`timeout`, `killed`) plus `exit_code` into the registry, so the real outcome is
+readable regardless of the wrapper: `pi_manage` `list` and `wait` surface the
+terminal `exit_code`. `pi_manage` `kill` stamps `exit_code: 143` itself, since
+the killed client never gets to write.
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | done: dispatch satisfied |
+| 3 | incomplete: correction budget exhausted (nudged out) |
+| 130 | KeyboardInterrupt (Ctrl-C) |
+| 143 | SIGTERM (external kill; kill action stamps 143 itself) |
+
+Other non-signal failures exit per Python conventions (traceback to stderr,
+non-zero).
+
+### Lane locks
+
+One live dispatch holds one lock per lane: the client writes
+`<cwd>/.hermes/lane/LOCK/<session_id>.lock` (JSON: `session_id`, `pid`,
+`model`, `started_at`) at dispatch start and removes it on every terminal
+exit — done, incomplete, timeout, and the SIGTERM unwind all release it. The
+dir sits inside the `.hermes/` ignore region.
+
+A crash that skips removal (SIGKILL, OOM, power loss) leaves a **stale**
+lock behind: same file, dead pid. `pi_manage list` surfaces `lane_lock`
+(`{present, stale}`) on any registry entry whose lock is on disk, and
+`salvage_report` adds the full row — path, payload, staleness, and the exact
+`rm` command to remove it (the action itself deletes nothing; removal
+deliberately stays a human decision).
+
+While a lane is LIVE, run parent gates only from a DIFFERENT worktree — or
+after worker exit. The lock makes that contention visible instead of
+silent: a concurrent gate run in the same worktree is exactly the
+build-cache collision this lock exists to catch.
 
 ### Worker isolation directory
 

@@ -65,10 +65,3 @@ class TestDispatchCmd:
         assert "--ns" not in cmd
         assert "--codemode" in cmd
         assert cmd.count("--prompt") == 1
-
-
-class TestCanaryContract:
-    def test_canary_is_single_file(self):
-        # canary = manifest[:1] by construction; guard the invariant
-        paths = ["a.go", "b.go", "c.go"]
-        assert paths[:1] == ["a.go"]

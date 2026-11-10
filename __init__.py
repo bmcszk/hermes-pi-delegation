@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import signal
+import subprocess
 import sys
 import time
 
@@ -31,7 +32,14 @@ WORKER_TYPES = {
         "thinking": "high",
     },
     "coder": {"tools": None, "use_codemode": True, "thinking": None},
-    "auditor": {"tools": None, "use_codemode": True, "thinking": None},
+    # text-deliverable review jobs: writes its report to the require_edit
+    # deliverable file; no shell, no codemode. nudge gate off by default.
+    "auditor": {
+        "tools": "read,grep,find,ls,write,edit",
+        "use_codemode": False,
+        "thinking": None,
+        "text_deliverable": True,
+    },
 }
 
 # Parent-side git-mutation deny: only when the command targets a git binary
@@ -115,6 +123,28 @@ def _live_session(session_id):
             except Exception:
                 continue
     return None
+
+
+def _lane_lock_info(cwd, session_id):
+    """Lane lock state for one session's cwd: None when absent, else present
+    plus stale (pid dead = crash leftover) and the lock's payload."""
+    if not cwd:
+        return None
+    path = os.path.join(cwd, ".hermes", "lane", "LOCK", f"{session_id}.lock")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except (OSError, ValueError):
+        payload = {}
+    pid = payload.get("pid")
+    return {
+        "present": True,
+        "stale": bool(pid) and not _pid_alive(pid),
+        "path": path,
+        "payload": payload,
+    }
 
 
 def _newest_registry_entry(session_id):
@@ -215,6 +245,22 @@ def _tool_schema(name, description, properties, required):
 
 
 LAUNCH_PARAMS = {
+    "auto": {
+        "type": "boolean",
+        "description": (
+            "run the generated command yourself as a detached background dispatch and "
+            "return dispatched/pid/session_id/log; default false keeps the paste-able "
+            "command output (no process spawned)"
+        ),
+    },
+    "create_anchor": {
+        "type": "boolean",
+        "description": (
+            "require_edit paths that do not exist get created as append-only lane-log "
+            "anchors (header: '## <slug> lane log (append-only)') instead of failing "
+            "preflight"
+        ),
+    },
     "worker_type": {
         "type": "string",
         "description": (
@@ -374,7 +420,15 @@ def register(ctx):
             {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "kill", "doctor", "logs", "wait", "steer"],
+                    "enum": [
+                        "list",
+                        "kill",
+                        "doctor",
+                        "logs",
+                        "wait",
+                        "steer",
+                        "salvage_report",
+                    ],
                 },
                 "session_id": {"type": "string"},
                 "message": {
@@ -478,13 +532,13 @@ def _pi_manage_impl(
             return {"error": "session_id required for wait"}
         budget = max(0, int(timeout_s or 0))
         poll = max(1, int(poll_s or 1))
-        if _newest_registry_entry(session_id) is None:
-            return {"finished": False, "status": "unknown"}
         return _wait_for_completion(session_id, budget, poll)
     if action == "doctor":
         return _doctor()
     if action == "logs":
         return _session_logs(session_id, lines)
+    if action == "salvage_report":
+        return _salvage_report(session_id, lines)
 
     if action == "list":
         agents = _read_registry()
@@ -498,6 +552,13 @@ def _pi_manage_impl(
             age = _heartbeat_age(entry.get("session"))
             if age is not None:
                 entry["last_activity_s"] = age
+        # every registered entry surfaces its lane lock when one sits on disk:
+        # a stale lock (pid dead, crash leftover) belongs on the DEAD row too,
+        # which is exactly where the crashed worker's row is still running.
+        for agent in agents:
+            lock = _lane_lock_info(agent.get("cwd"), agent.get("session"))
+            if lock is not None:
+                agent["lane_lock"] = {"present": True, "stale": lock["stale"]}
         agents.sort(key=lambda e: e.get("started", ""), reverse=True)
         return {"agents": agents}
 
@@ -525,7 +586,9 @@ def _pi_manage_impl(
                 except Exception:
                     return {"error": f"cannot verify cmdline of pid {pid}"}
                 os.killpg(pid, signal.SIGTERM)  # client AND its pi + tool children
-                _registry_update(session_id, pid, status="killed", finished=_now_iso())
+                _registry_update(
+                    session_id, pid, status="killed", exit_code=143, finished=_now_iso()
+                )
                 return {"status": f"SIGTERM sent to pgid {pid} ({session_id})"}
         if seen_dead_pid is not None:
             return {
@@ -534,21 +597,184 @@ def _pi_manage_impl(
         return {"error": f"Session {session_id} not found in registry"}
 
 
+def _wait_result(session_id, entry):
+    """Derived wait answer for one registry row: running/terminal/last_activity_s.
+
+    unknown is reserved for a session with no registry rows at all; a known
+    row always yields its derived fields, even when a concurrent whole-file
+    rewrite makes one read land partial.
+    """
+    status = entry.get("status") or "running"
+    pid = entry.get("pid")
+    result = {"finished": _wait_finished(entry), "status": status, "pid": pid}
+    if not result["finished"] and _pid_alive(pid):
+        age = _heartbeat_age(session_id)
+        if age is not None:
+            result["last_activity_s"] = age
+    if entry.get("exit_code") is not None:
+        result["exit_code"] = entry["exit_code"]
+    return result
+
+
 def _wait_for_completion(session_id, budget, poll):
-    """Probe the registry until the session settles or the budget runs out."""
+    """Probe the registry until the session settles or the budget runs out.
+
+    Never answers unknown for a registered session: unknown comes only from
+    the caller-side probe (no registry rows for this session at all), never
+    from inside the loop.
+    """
     deadline = time.monotonic() + budget
     while True:
         entry = _newest_registry_entry(session_id)
         if entry is None:
-            return {"finished": False, "status": "unknown"}
-        status = entry.get("status") or "running"
-        pid = entry.get("pid")
-        if _wait_finished(entry):
-            return {"finished": True, "status": status, "pid": pid}
-        remaining = deadline - time.monotonic()
-        if remaining < poll:
-            return {"finished": False, "status": status, "pid": pid}
+            if time.monotonic() >= deadline:
+                return {"finished": False, "status": "unknown"}
+            time.sleep(poll)
+            continue
+        result = _wait_result(session_id, entry)
+        if result["finished"] or deadline - time.monotonic() < poll:
+            return result
         time.sleep(poll)
+
+
+def _git_readonly(cwd, *args):
+    """Run a read-only git command in cwd. Returns (ok, stdout)."""
+    try:
+        proc = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=30)
+        return proc.returncode == 0, (proc.stdout if proc.returncode == 0 else proc.stderr)
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _base_is_valid(cwd, base):
+    return bool(base) and bool(_git_readonly(cwd, "cat-file", "-e", f"{base}^{{commit}}")[0])
+
+
+def _gate_row(name, command, cwd):
+    """One salvage gate row: ok plus a short output tail or a named reason.
+
+    cwd comes from the registry row: the gate must judge THE SESSION'S tree,
+    not the caller's. A failing invocation (command absent, unwritable cwd,
+    120 s timeout cap) degrades to a skipped row."""
+    try:
+        proc = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=120, cwd=cwd
+        )
+        tail = (proc.stdout + proc.stderr)[-2000:]
+        return {"name": name, "command": command, "ok": proc.returncode == 0, "output_tail": tail}
+    except Exception as exc:
+        return {
+            "name": name,
+            "command": command,
+            "ok": False,
+            "output_tail": "",
+            "skipped": str(exc),
+        }
+
+
+def _salvage_report(session_id, lines=12):
+    """Post-exit state collection for one session, in one call, shaped to
+    paste as the on-disk state section of a continuation contract. Read-only,
+    best-effort: every leg degrades to a named skip instead of raising.
+    """
+    entry = _newest_registry_entry(session_id)
+    if entry is None:
+        return {"finished": False, "status": "unknown"}
+    cwd = entry.get("cwd")
+    base = entry.get("base")
+    valid_base = _base_is_valid(cwd, base) if cwd else False
+
+    git_report = {}
+    if cwd and _git_readonly(cwd, "status")[0]:
+        ok_status, status_out = _git_readonly(cwd, "status", "--porcelain")
+        git_report["status"] = status_out if ok_status else ""
+        ok_head, head_out = _git_readonly(cwd, "log", "--oneline", "-1")
+        ok_sha, sha_out = _git_readonly(cwd, "rev-parse", "HEAD")
+        git_report["branch_head"] = "\n".join(x.strip() for x in (head_out, sha_out) if x)
+        if valid_base:
+            ok_log, log_out = _git_readonly(cwd, "log", "--oneline", f"{base}..HEAD")
+            git_report["commits_since_base"] = (
+                log_out.splitlines() if ok_log else {"skipped": log_out}
+            )
+            ok_diff, diff_out = _git_readonly(cwd, "diff", f"{base}..HEAD", "--stat")
+            git_report["diff_stat"] = (
+                diff_out.splitlines()[-6:] if ok_diff else {"skipped": diff_out}
+            )
+        else:
+            reason = (
+                "no base recorded for this row"
+                if not base
+                else "unknown revision: base not a commit of this repo"
+            )
+            git_report["commits_since_base"] = {"skipped": reason}
+            git_report["diff_stat"] = {"skipped": f"{reason}; uncommitted facts visible via status"}
+    else:
+        reason = "no recorded cwd for this row" if not cwd else f"cwd is not a git repo: {cwd}"
+        git_report["status"] = ""
+        git_report["branch_head"] = ""
+        git_report["commits_since_base"] = {"skipped": reason}
+        git_report["diff_stat"] = {"skipped": reason}
+
+    frames = _session_logs(session_id, lines)
+
+    lock = _lane_lock_info(cwd, session_id)
+    if lock is not None:
+        lane_lock_row = {
+            "path": lock["path"],
+            "stale": lock["stale"],
+            "payload": lock["payload"],
+            "removal": f"rm {lock['path']}" + ("  # stale: pid gone" if lock["stale"] else ""),
+        }
+    else:
+        lane_lock_row = {"present": False}
+
+    return {
+        "session": session_id,
+        "cwd": cwd,
+        "base": base,
+        "collected_at": _now_iso(),
+        "git": git_report,
+        "frames": {
+            k: frames[k]
+            for k in ("error", "path", "mtime", "tool_calls", "last_text", "tail")
+            if k in frames
+        },
+        "lane_lock": lane_lock_row,
+        "gates": [
+            _gate_row("uvx-ruff-check", "uvx ruff check .", cwd),
+            _gate_row(
+                "compileall-plugin", "python -m compileall -q __init__.py scripts tests", cwd
+            ),
+        ],
+    }
+
+
+def _dispatch_command(command, cwd, session_id):
+    """auto=true: run the generated one-liner detached, log to the lane dir.
+
+    bash -c receives the EXACT emitted command (preflight echo + budget echo
+    + client) with stdout/stderr into <cwd>/.hermes/lane/<session_id>.log;
+    the redirect keeps the parent's stdout clean. start_new_session detaches
+    the worker's process group so the kill path (client pid pgid) stays exact
+    and a gateway restart cannot take the worker down. Best-effort: a spawn
+    failure returns the error shape instead of raising.
+    """
+    log_dir = os.path.join(cwd, ".hermes", "lane")
+    log_path = os.path.join(log_dir, f"{session_id}.log")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        with open(log_path, "w") as log:
+            proc = subprocess.Popen(
+                ["bash", "-c", command],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                cwd=cwd,
+                start_new_session=True,
+            )
+    except OSError as exc:
+        return {"error": f"$dispatch failed to spawn: {exc}", "log": log_path}
+    return {"dispatched": True, "pid": proc.pid, "session_id": session_id, "log": log_path}
 
 
 def _doctor():
@@ -584,17 +810,32 @@ def _doctor():
     return report
 
 
+def _transcript_for(session_id):
+    """Resolve a session's transcript path, or None.
+
+    Registry log_path first (the client learned pi's real transcript even when
+    its filename lacks the session slug), then the legacy slug glob for rows
+    recorded before that fix.
+    """
+    import glob
+
+    entry = _newest_registry_entry(session_id)
+    if entry is not None:
+        registered = entry.get("log_path")
+        if registered and os.path.isfile(registered):
+            return registered
+    pattern = os.path.expanduser(f"~/.pi/agent/sessions/*/*{session_id}*.jsonl")
+    matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+    return matches[0] if matches else None
+
+
 def _session_logs(session_id, lines=40):
     """Tail the newest pi session log for a session id."""
     if not session_id:
         return {"error": "logs requires session_id"}
-    import glob
-
-    pattern = os.path.expanduser(f"~/.pi/agent/sessions/*/*{session_id}*.jsonl")
-    matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
-    if not matches:
+    path = _transcript_for(session_id)
+    if not path:
         return {"error": f"no session log for {session_id}"}
-    path = matches[0]
     tail, tool_calls, last_text = [], 0, ""
     try:
         with open(path) as handle:
@@ -665,6 +906,99 @@ def _launch_session_id(cwd, worker_type, epic_id, task_slug):
     return f"task-{os.path.basename(os.path.normpath(cwd))}-{worker_type}"
 
 
+def _anchor_header(path):
+    """Standard append-only lane-log header for a require_edit anchor."""
+    slug = os.path.splitext(os.path.basename(path))[0]
+    return f"## {slug} lane log (append-only)"
+
+
+def _preflight(
+    cwd,
+    contract_path,
+    require_edit,
+    create_anchor,
+    resolved_skills,
+    timeout_s,
+    wall_timeout_s,
+    min_tool_calls,
+    max_nudges,
+    worker_type="default",
+):
+    """Fail-fast contract and budget checks before a worker spawns.
+
+    Returns (create_anchor_ok, failures list). Every check names itself, so
+    the aggregated error lists ALL failed checks, not just the first.
+    """
+    failures = []
+
+    if not os.path.isfile(os.path.expanduser(contract_path)):
+        failures.append(f"contract - not found or unreadable: {contract_path}")
+
+    if require_edit:
+        targets = [require_edit] if isinstance(require_edit, str) else list(require_edit)
+        for anchor in targets:
+            if not anchor:
+                failures.append("require_edit anchors - empty path entry")
+                continue
+            anchored = anchor if os.path.isabs(anchor) else os.path.join(cwd, anchor)
+            if os.path.exists(anchored):
+                continue
+            if create_anchor:
+                try:
+                    with open(anchored, "w") as f:
+                        f.write(_anchor_header(anchored) + "\n")
+                except OSError as exc:
+                    failures.append(f"require_edit anchors - cannot create {anchor}: {exc}")
+            else:
+                failures.append(
+                    f"require_edit anchors - missing: {anchored} "
+                    "(exists-check; create_anchor=true to create it)"
+                )
+
+    for skill in resolved_skills:
+        if not os.path.isdir(skill):
+            failures.append(f"skills - not a directory: {skill}")
+        elif not os.path.isfile(os.path.join(skill, "SKILL.md")):
+            failures.append(f"skills - directory lacks SKILL.md: {skill}")
+
+    if (
+        wall_timeout_s is not None
+        and timeout_s is not None
+        and int(wall_timeout_s) <= int(timeout_s)
+    ):
+        failures.append(
+            f"budgets - wall_timeout_s ({wall_timeout_s}) must exceed timeout_s ({timeout_s})"
+        )
+    min_max_passed = min_tool_calls is not _UNSET or max_nudges is not _UNSET
+    if worker_type == "auditor" and not require_edit:
+        failures.append(
+            "auditor - mode aims at no deliverable: require_edit names the file the "
+            "final text is written into"
+        )
+    min_calls = 0 if min_tool_calls is _UNSET else int(min_tool_calls or 0)
+    max_nudges = 0 if max_nudges is _UNSET else int(max_nudges or 0)
+    if max_nudges > 0 and min_calls < 1:
+        failures.append(
+            "budgets - min_tool_calls < 1 while max_nudges > 0: the nudge gate "
+            "cannot tell work from luck"
+        )
+    if min_max_passed and not require_edit:
+        failures.append(
+            "budgets - min_tool_calls/max_nudges set without require_edit: the gate has no aim"
+        )
+
+    if not (
+        os.path.isfile(os.path.join(cwd, ".beans.yml"))
+        or os.path.isfile(os.path.join(cwd, "AGENTS.md"))
+    ):
+        failures.append(
+            "cwd - right-repo guard: launch cwd has neither .beans.yml nor AGENTS.md at "
+            "its root; add one of them (e.g. AGENTS.md)"
+        )
+
+    return failures
+
+
 def _pi_launch_impl(
     contract_path,
     cwd,
@@ -679,6 +1013,8 @@ def _pi_launch_impl(
     max_nudges=_UNSET,
     timeout_s=None,
     wall_timeout_s=None,
+    create_anchor=False,
+    auto=False,
     **_,
 ):
     """Generate a single-line POSIX shell command for pi_rpc_client.py.
@@ -716,13 +1052,11 @@ def _pi_launch_impl(
     if not isinstance(cwd, str) or not os.path.isdir(cwd):
         return {"error": f"cwd must be an existing directory (absolute project dir), got: {cwd!r}"}
 
-    if not os.path.isfile(os.path.expanduser(contract_path)):
-        return {"error": f"contract_path not found: {contract_path}"}
-
     session_id = _launch_session_id(cwd, worker_type, epic_id, task_slug)
 
     warnings = []
     resolved_skills = []
+    preflight_skill_failures = []
     for skill in skills:
         expanded = os.path.expanduser(skill)
         if os.path.exists(expanded):
@@ -730,13 +1064,14 @@ def _pi_launch_impl(
         else:
             found = _resolve_skill_name(skill, cwd)
             if found is None:
-                return {"error": f"skill not found: {skill}"}
+                preflight_skill_failures.append(f"skills - not resolved: {skill}")
+                continue
             resolved = found
         if not _skill_discoverable(resolved, cwd):
             warnings.append(
-                f"{skill} is outside pi skill discovery (.agents/.pi under cwd ancestors); "
-                "worker reads it only via the absolute path, so the contract must "
-                "quote this exact path"
+                f"preflight warn: {skill} is outside pi skill discovery "
+                "(.agents/.pi under cwd ancestors); worker reads it only via the absolute "
+                "path, so the contract must quote this exact path"
             )
         resolved_skills.append(resolved)
     skills = resolved_skills
@@ -744,6 +1079,24 @@ def _pi_launch_impl(
     live_pid = _live_session(session_id)
     if live_pid is not None:
         return {"error": f"session {session_id} already running (pid {live_pid})"}
+
+    failures = (
+        _preflight(
+            cwd,
+            contract_path,
+            require_edit,
+            create_anchor,
+            resolved_skills,
+            timeout_s,
+            wall_timeout_s,
+            min_tool_calls,
+            max_nudges,
+            worker_type,
+        )
+        + preflight_skill_failures
+    )
+    if failures:
+        return {"error": "preflight: " + "; ".join(failures)}
 
     # Single-line POSIX command, shlex-quoted throughout. Double quotes around
     # $(cat ...) so command substitution happens at shell level.
@@ -784,6 +1137,8 @@ def _pi_launch_impl(
         )
     if cfg["use_codemode"]:
         parts.append("--codemode")
+    if cfg.get("text_deliverable"):
+        parts.append("--auditor-deliverable")
     if cfg["tools"]:
         parts.extend(["--tools", cfg["tools"]])
     if cfg["thinking"]:
@@ -803,28 +1158,39 @@ def _pi_launch_impl(
         # Wall must exceed the idle budget or long sweeps die mid-contract.
         resolved_wall = max(3600, resolved_timeout + 900)
     elif resolved_wall < resolved_timeout:
-        return {
-            "error": f"wall_timeout_s ({resolved_wall}) must be >= timeout_s ({resolved_timeout})"
-        }
+        failures = [
+            f"budgets - wall_timeout_s ({resolved_wall}) must be >= timeout_s ({resolved_timeout})"
+        ]
+        return {"error": "preflight: " + "; ".join(failures)}
     parts.extend(["--wall-timeout", str(resolved_wall)])
 
     if require_edit:
         targets = require_edit if isinstance(require_edit, str) else ",".join(require_edit)
-        min_calls = 3 if min_tool_calls is _UNSET else int(min_tool_calls)
-        max_nudges_resolved = 4 if max_nudges is _UNSET else int(max_nudges)
+        if worker_type == "auditor":
+            min_calls = 1 if min_tool_calls is _UNSET else int(min_tool_calls)
+            max_nudges_resolved = 0 if max_nudges is _UNSET else int(max_nudges)
+        else:
+            min_calls = 3 if min_tool_calls is _UNSET else int(min_tool_calls)
+            max_nudges_resolved = 4 if max_nudges is _UNSET else int(max_nudges)
+        nudge_clause = (
+            "nudge: 0 - no correction loop"
+            if max_nudges_resolved == 0
+            else f"nudge: >={min_calls} tool calls, <={max_nudges_resolved} nudges then exit 3"
+        )
         parts.extend(["--require-edit", targets])
         parts.extend(["--min-tool-calls", str(min_calls)])
         parts.extend(["--max-nudges", str(max_nudges_resolved)])
-    elif min_tool_calls is not _UNSET or max_nudges is not _UNSET:
-        return {
-            "error": (
-                "min_tool_calls/max_nudges require require_edit "
-                "(the gate is inert without an edit target)"
-            )
-        }
+    else:
+        # preflight already refuses min/max without require_edit
+        nudge_clause = "nudge: 0 - no correction loop"
     parts.extend(["--prompt", f"$(cat {shlex.quote(contract_path)})"])
 
-    command = " ".join(shlex.quote(p) for p in parts[:-1])
+    command = "echo 'preflight ok: contract, require_edit anchors, skills, budgets, cwd' && "
+    budget_note = (
+        f"budget: per-call <= {resolved_timeout}s, wall <= {resolved_wall}s, {nudge_clause}"
+    )
+    command += f"echo {shlex.quote(budget_note)} && "
+    command += " ".join(shlex.quote(p) for p in parts[:-1])
     # Last part keeps $(cat ...) unquoted at the outer level: shlex.quote would
     # suppress substitution, so emit it double-quoted manually.
     command += f' "$(cat {shlex.quote(contract_path)})"'
@@ -835,6 +1201,8 @@ def _pi_launch_impl(
         "worker_type": worker_type,
         "mode": mode,
     }
+    if auto:
+        return _dispatch_command(command, cwd, session_id)
     if system_prompt is not None:
         result["system_prompt"] = system_prompt
     if warnings:

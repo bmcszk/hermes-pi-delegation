@@ -16,15 +16,27 @@ repo README; this skill is only the control loop.
    done. The worker sees nothing else, so state that must survive belongs in
    the contract, not in chat.
 2. `pi_launch(contract_path, cwd, require_edit=<exact file>)` returns a
-   one-line command. Run it verbatim in the background; never hand-write it.
-   Pick the worker type by job: `coder` edits code, `brainer` writes
-   verdicts and docs, `reasoner` is read-only. Set `wall_timeout_s` as the
+   one-line command. With `auto=true` the launcher runs it itself as a
+   detached worker process group - the typed path; the returned dict
+   carries dispatched/pid/session_id and the transcript log path. Without
+   it, run the command verbatim in the background; when a host wrapper adds
+   output redirection, end the wrapper with `rc=$?; echo "TAG=$rc"; exit
+   $rc`: a trailing bare echo reports the wrapper's success as the job's
+   exit code and masks a SIGTERM as exit 0. Pick the worker type by job:
+   `coder` edits code, `brainer` writes verdicts and docs, `auditor` runs
+   read-only review with its final text written into `require_edit` as the
+   deliverable, `reasoner` is read-only. Set `wall_timeout_s` as the
    hard ceiling per dispatch; `min_tool_calls` and `max_nudges` arm the
    correction loop (a worker that edits nothing is nudged up to the budget,
    then exits 3). `epic_id` and `task_slug` name the session; run one
    worker per project at a time.
 3. `pi_manage(action="wait", session_id=<id>)` blocks until the registry
-   line is terminal and the pid is gone. Never sleep and poll.
+   line is terminal and the pid is gone. Never sleep and poll. `wait`
+   answers `finished: false` with `status: unknown` only when the registry
+   holds no rows for the session at that probe (a fresh dispatch in its
+   first seconds); registered workers get a derived running or terminal
+   status. On an unknown, re-check via `list` `last_activity_s` once the
+   registry line lands, or wait on the client process itself.
 4. Verify the work on disk yourself: diff, gates, test counts. A completion
    report is a claim, not a result.
 
@@ -35,6 +47,15 @@ looking busy. `pi_manage(action="list", only_running=true)` reports
 `last_activity_s` per running worker: seconds since the client last framed.
 A large age with a live pid means stalled or silent. Kill it, read the tree
 on disk, relaunch fresh.
+
+## Lane locks
+
+A live dispatch holds `<cwd>/.hermes/lane/LOCK/<session_id>.lock` for its
+whole run; `list` surfaces it per running entry and `salvage_report` names
+it with the exact rm command when it went stale. While a lane is live the
+parent does not run gates or builds in the same tree: work in a different
+worktree or wait for the exit - a same-tree contention forced a mid-wave
+kill once (exit 143).
 
 ## Steer
 
@@ -56,19 +77,42 @@ and all tool children in the process group. Prompting a stalled session
 again fails with "already processing": kill first, then relaunch on a fresh
 session id whose contract opens with the on-disk state.
 
-Salvage order after any exit: `git status` and `git log` since the base
-first, then gates. Green work in progress gets committed; red work stays in
-place with its exact state named in the continuation contract. Exit 3 is
-salvage, not failure. Exit 0 with zero edits is the opposite trap: believe
-the tree, not the words.
+Salvage order after any exit: `pi_manage(action="salvage_report",
+session_id=<id>)` collects the state in one call - git status, branch head,
+commits since the dispatch base, diff stat, the transcript tail, and cheap
+gate rows, run read-only in the recorded cwd. Green work in progress gets
+committed; red work stays in place with its exact state named in the
+continuation contract. Exit 3 is salvage, not failure. Exit 0 with zero
+edits is the opposite trap: believe the tree, not the words.
 
 ## Contract minimums
 
 - One deliverable per dispatch; long work gets chained slices.
+- Tasks and bugs land TDD: the coder writes the failing tests against the
+  unfixed tree first, records the RED run as evidence, then lands only the
+  change that turns them green.
+- The ledger belongs to the orchestrator: a worker never touches `.beans/`
+  state or statuses; claims, PoW, and closure gates stay with the parent.
 - `require_edit` takes one exact file path, never a directory.
+- Aim `require_edit` at a file the contract itself orders the worker to
+  create or modify; aiming it at files whose edits predate the dispatch
+  burns the whole nudge budget on a satisfied tree and exits 3. Worktree-
+  scoped dispatches repeat the trap one level deeper: aim at the lane
+  result file there too.
 - Commit one unit at a time so partial progress survives a timeout.
 - Keep each write payload small. One giant write dies mid-JSON and repeats
   until the correction budget is gone.
+- Stage via explicitly enumerated `git add <paths>`: a bare `add`/`-A` sweep
+  ships unrelated churn (state-file attr changes, lane artifacts) into the
+  commit and onto a pushed remote that no rewrite can clean without a force.
+- A prohibition the worker must not violate gets a mechanical gate (an
+  ignored path, a deny hook, a pre-commit check), never contract text alone.
+- A worker that stops with a blocked/spec-defect verdict plus partial commits
+  is acting correctly: believe the diagnosis, fix the contract and relaunch.
+- Embed a script in a contract only after mentally running each parse branch
+  against the manifest's shortest and longest lines; positional field-binding
+  bugs (a two-field line against a three-field `read`) hide there and
+  half-land before any worker catch.
 
 ## State files
 

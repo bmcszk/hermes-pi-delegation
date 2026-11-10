@@ -1,9 +1,12 @@
 """Tests for pi_rpc_client. No network, no model calls, no real pi process."""
 
+import contextlib
 import json
+import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -418,6 +421,82 @@ class TestRegistryUpdate:
         assert rows[0]["status"] == "done"
         assert rows[0]["pid"] == 222
 
+    def test_terminal_line_carries_known_exit_code(self, tmp_path, monkeypatch):
+        mod = self._write_registry(tmp_path, monkeypatch, [])
+        mod._registry_write("S3", "m", "done", pid=333, exit_code=0)
+        with open(mod.REGISTRY_PATH) as f:
+            rows = [json.loads(line) for line in f]
+        assert rows[0]["exit_code"] == 0
+
+    def test_running_line_has_no_exit_code_by_default(self, tmp_path, monkeypatch):
+        mod = self._write_registry(tmp_path, monkeypatch, [])
+        mod._registry_write("S4", "m", "running", pid=444)
+        with open(mod.REGISTRY_PATH) as f:
+            rows = [json.loads(line) for line in f]
+        assert "exit_code" not in rows[0]
+
+    def test_terminal_without_code_stays_absent_no_null(self, tmp_path, monkeypatch):
+        mod = self._write_registry(tmp_path, monkeypatch, [])
+        mod._registry_write("S5", "m", "timeout", pid=555, exit_code=None)
+        with open(mod.REGISTRY_PATH) as f:
+            rows = [json.loads(line) for line in f]
+        assert "exit_code" not in rows[0]
+
+    def test_killed_exit_code_maps_sigterm_and_interrupt(self):
+        import pi_rpc_client as mod
+
+        assert mod._killed_exit_code(SystemExit(143)) == 143
+        assert mod._killed_exit_code(KeyboardInterrupt()) == 130
+        assert mod._killed_exit_code(RuntimeError("x")) is None
+        assert mod._killed_exit_code(SystemExit("128+15")) is None
+
+    def test_registry_update_running_carries_log_path(self, tmp_path, monkeypatch):
+        mod = self._write_registry(tmp_path, monkeypatch, [])
+        mod._registry_write("S6", "m", "running", pid=666)
+        mod._registry_patch("S6", 666, log_path="/pi/sessions/d/x.jsonl")
+        mod._registry_write("S6", "m", "done", pid=666, exit_code=0)
+        with open(mod.REGISTRY_PATH) as f:
+            rows = [json.loads(line) for line in f]
+        terminal = [r for r in rows if r["pid"] == 666]
+        assert len(terminal) == 1
+        assert terminal[0]["status"] == "done"
+        assert terminal[0]["exit_code"] == 0
+        assert terminal[0]["log_path"] == "/pi/sessions/d/x.jsonl"
+
+    def test_registry_update_running_killed_row_keeps_log_path(self, tmp_path, monkeypatch):
+        mod = self._write_registry(tmp_path, monkeypatch, [])
+        mod._registry_write("S7", "m", "running", pid=777)
+        mod._registry_patch("S7", 777, log_path="/pi/sessions/d/y.jsonl")
+        mod._registry_write("S7", "m", "killed", pid=777, exit_code=143)
+        with open(mod.REGISTRY_PATH) as f:
+            rows = [json.loads(line) for line in f]
+        terminal = [r for r in rows if r["pid"] == 777]
+        assert len(terminal) == 1
+        assert terminal[0]["status"] == "killed"
+        assert terminal[0]["log_path"] == "/pi/sessions/d/y.jsonl"
+
+    def test_discovered_log_path_prefers_content_id_match(self, tmp_path, monkeypatch):
+        """Id-less filenames for two fresh transcripts: each client stamps the
+        candidate whose leading bytes carry its own session id."""
+        import pi_rpc_client as mod
+
+        sessions = tmp_path / "sessions"
+        (sessions / "d1").mkdir(parents=True)
+        other = sessions / "d1" / "2026-01-01T_uuid-other.jsonl"
+        mine = sessions / "d1" / "2026-01-01T_uuid-mine.jsonl"
+        other.write_text(
+            '{"type":"session","version":3,"id":"someone-else","timestamp":"t"}\n' + "x" * 20000
+        )
+        mine.write_text(
+            '{"type":"session","version":3,"id":"my-worker","timestamp":"t"}\n' + "x" * 20000
+        )
+        # keep both firmly newer than any launch floor
+        mtime = time.time() + 60
+        os.utime(other, (mtime, mtime))
+        os.utime(mine, (mtime + 1, mtime + 1))
+        monkeypatch.setattr("pi_rpc_client._LAUNCH_MONOTONIC_SKEW_FLOOR", time.time() - 120)
+        assert mod._discovered_log_path(tmp_path, "my-worker") == str(mine)
+
 
 class TestPiBinaryDiscovery:
     """Binary discovery is machine-agnostic: PATH first, then per-user roots."""
@@ -543,3 +622,224 @@ class TestHeartbeat:
         client.session_id = None
         client._heartbeat_tick(force=True)
         assert not list(tmp_path.glob("pi-heartbeat-*"))
+
+
+def _terminal_registry_line(registry_path: Path, session_id: str) -> dict:
+    """Newest registry entry for session_id, or AssertionError with all rows."""
+    rows = [json.loads(line) for line in registry_path.read_text().splitlines() if line]
+    matches = [r for r in rows if r.get("session") == session_id]
+    assert matches, rows
+    return sorted(matches, key=lambda r: r["started"])[-1]
+
+
+FAKE_PI_SH = """#!/bin/sh
+echo '{"type":"ready"}'
+exec sleep 5
+"""
+
+
+class TestMainExitCode:
+    """main() end to end: the process return value and the registry's terminal exit_code."""
+
+    SESSION = "sess-exit"
+
+    def _child(self, tmp_path: Path, fake_pi_sh: str | None = None) -> tuple[list[str], dict, Path]:
+        # Run as a real script: only then does the __main__ block install the
+        # SIGTERM handler the production path uses. HOME pins the registry
+        # under tmp_path, so the subprocess never touches the machine's file.
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        fake_pi = bin_dir / "pi"
+        fake_pi.write_text(fake_pi_sh or FAKE_PI_SH)
+        fake_pi.chmod(0o755)
+        env = {
+            **os.environ,
+            "HOME": str(tmp_path),
+            "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+        }
+        argv = [
+            sys.executable,
+            str(SCRIPTS_DIR / "pi_rpc_client.py"),
+            "--session-id",
+            self.SESSION,
+            "--model",
+            "m",
+            "--prompt",
+            "p",
+            "--timeout",
+            "60",
+        ]
+        return argv, env, tmp_path / ".hermes" / "logs" / "pi-agents.jsonl"
+
+    def test_sigterm_midrun_registry_carries_143(self, tmp_path):
+        # given a client child blocked waiting for an agent_end that never comes
+        argv, env, registry = self._child(tmp_path)
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if registry.exists() and "running" in registry.read_text():
+                break
+            time.sleep(0.05)
+        assert registry.exists(), "child never wrote its running line"
+
+        # when the parent SIGTERMs the child mid-run
+        proc.terminate()
+        rc = proc.wait(timeout=10)
+
+        # then the child exits 143 and its terminal registry line says so
+        assert rc == 143, rc
+        entry = _terminal_registry_line(registry, self.SESSION)
+        assert entry["status"] == "killed"
+        assert entry["exit_code"] == 143
+
+    def test_sigterm_killed_row_keeps_discovered_log_path(self, tmp_path):
+        # given a client child whose fake pi leaves a transcript with an id-less
+        # filename under the agent-dir sessions tree
+        fake_pi_sh = """#!/bin/sh
+mkdir -p "$HOME/.pi/agent/sessions/spawn-dir"
+printf '%s\n' '{"type":"session","version":3,"id":"sess-exit","timestamp":"t"}' \
+  > "$HOME/.pi/agent/sessions/spawn-dir/2026-01-01T_blank-id.jsonl"
+echo '{"type":"ready"}'
+exec sleep 60
+"""
+        argv, env, registry = self._child(tmp_path, fake_pi_sh=fake_pi_sh)
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if registry.exists():
+                with open(registry) as f:
+                    if any("log_path" in line for line in f):
+                        break
+            time.sleep(0.05)
+        assert registry.exists(), "child never stamped log_path"
+
+        # when the parent SIGTERMs the child mid-run
+        proc.terminate()
+        rc = proc.wait(timeout=10)
+
+        # then the final killed row still carries the discovered transcript
+        assert rc == 143, rc
+        entry = _terminal_registry_line(registry, self.SESSION)
+        assert entry["status"] == "killed"
+        assert entry["exit_code"] == 143
+        transcript = (
+            tmp_path / ".pi" / "agent" / "sessions" / "spawn-dir" / "2026-01-01T_blank-id.jsonl"
+        )
+        assert entry["log_path"] == str(transcript), entry
+
+    def test_done_run_registry_carries_0(self, tmp_path, monkeypatch):
+        # given main() driving the scripted fake pi whose run makes no tool calls
+        import pi_rpc_client as mod
+
+        monkeypatch.setattr(mod, "REGISTRY_PATH", str(tmp_path / "pi-agents.jsonl"))
+        real_init = mod.PiRpcClient.__init__
+
+        def fake_init(self, *a, **kw):
+            kw["proc_factory"] = lambda argv, **k: FakePiRpcProc(scripted_lines("ok"))
+            real_init(self, *a, **kw)
+
+        monkeypatch.setattr(mod.PiRpcClient, "__init__", fake_init)
+
+        # when the dispatch completes normally
+        rc = mod.main(
+            [
+                "--session-id",
+                self.SESSION,
+                "--model",
+                "m",
+                "--prompt",
+                "p",
+                "--timeout",
+                "30",
+                "--min-tool-calls",
+                "0",
+            ]
+        )
+
+        # then done exit 0 lands in both the return value and the registry
+        assert rc == 0
+        entry = _terminal_registry_line(tmp_path / "pi-agents.jsonl", self.SESSION)
+        assert entry["status"] == "done"
+        assert entry["exit_code"] == 0
+
+    def test_incomplete_run_registry_carries_3(self, tmp_path, monkeypatch):
+        # given min_tool_calls=1 while the scripted run makes zero tool calls
+        import pi_rpc_client as mod
+
+        monkeypatch.setattr(mod, "REGISTRY_PATH", str(tmp_path / "pi-agents.jsonl"))
+        real_init = mod.PiRpcClient.__init__
+
+        def fake_init(self, *a, **kw):
+            kw["proc_factory"] = lambda argv, **k: FakePiRpcProc(scripted_lines("ok"))
+            real_init(self, *a, **kw)
+
+        monkeypatch.setattr(mod.PiRpcClient, "__init__", fake_init)
+
+        # when the dispatch completes without work (nudges exhausted by max)
+        rc = mod.main(
+            [
+                "--session-id",
+                self.SESSION,
+                "--model",
+                "m",
+                "--prompt",
+                "p",
+                "--timeout",
+                "30",
+                "--max-nudges",
+                "0",
+            ]
+        )
+
+        # then the incomplete verdict is return 3 and registry exit_code 3
+        assert rc == 3
+        entry = _terminal_registry_line(tmp_path / "pi-agents.jsonl", self.SESSION)
+        assert entry["status"] == "incomplete"
+        assert entry["exit_code"] == 3
+
+
+class TestHeartbeatBudget:
+    """A failed stamp never consumes the 5 s budget; the dir gets ensured."""
+
+    def test_failed_write_does_not_consume_the_beat_budget(self, tmp_path, monkeypatch):
+        # given the write path is broken: the heartbeat dir sits under a FILE,
+        # so the ensure fails and the tick lands nowhere
+        import pi_rpc_client as mod
+
+        logs_dir = tmp_path / "blocked"
+        logs_dir.write_text("this is a file, not a dir")
+        monkeypatch.setattr(mod, "REGISTRY_PATH", str(logs_dir / "pi-agents.jsonl"))
+        client, _ = make_client(scripted_lines("x"))
+        client.session_id = "sess-budget"
+        hb_path = logs_dir / "pi-heartbeat-sess-budget.json"
+        client._heartbeat_tick(force=True)
+        assert not hb_path.exists()
+        # the failed write moved nothing: the budget stays at its initial value
+        assert client._last_beat == 0.0, "failed write consumed the budget"
+
+        # when the blocker is removed and the NEXT FRAME arrives immediately
+        # (a real clock tick: real_now - the untouched budget >> 5 s)
+        logs_dir.unlink()
+        logs_dir.mkdir(parents=True)
+        client._heartbeat_tick()
+
+        # then the stamp lands
+        assert hb_path.exists(), "second tick was silently dropped"
+
+    def test_first_tick_creates_dir_and_stamps(self, tmp_path, monkeypatch):
+        import pi_rpc_client as mod
+
+        logs_dir = tmp_path / "logs"
+        monkeypatch.setattr(mod, "REGISTRY_PATH", str(logs_dir / "pi-agents.jsonl"))
+        client, _ = make_client(scripted_lines("x"))
+        client.session_id = "sess-budget"
+        hb_path = logs_dir / "pi-heartbeat-sess-budget.json"
+        # given any construction-time leftovers are out of the way
+        with contextlib.suppress(OSError):
+            os.remove(hb_path)
+
+        client._heartbeat_tick(force=True)
+
+        assert hb_path.exists(), "fresh dispatch stamp never landed"
+        data = json.loads(hb_path.read_text())
+        assert data["frames"] == client._frames_seen

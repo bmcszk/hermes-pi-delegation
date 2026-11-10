@@ -28,6 +28,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -44,6 +45,10 @@ REGISTRY_PATH = os.path.join(os.path.expanduser("~"), ".hermes", "logs", "pi-age
 # regex heredoc burned one core at 100% for 2 days). WALL_TIMEOUT_S is the
 # hard ceiling on one dispatch regardless of frame traffic.
 WALL_TIMEOUT_S = float(os.environ.get("PI_WORKER_WALL_TIMEOUT_S", "3600"))
+
+# Transcript discovery floor: sessions created before the client started are
+# other workers' transcripts; wall-clock launch time bounds the scan window.
+_LAUNCH_MONOTONIC_SKEW_FLOOR = time.time()
 
 
 # Both live under the registry dir so test setups that monkeypatch
@@ -83,7 +88,170 @@ def _take_steer(session_id):
     return None
 
 
-def _registry_write(session_id, model, status, pid=None):
+def _killed_exit_code(exc):
+    """Client exit code for a killed run: SIGTERM 143 (SystemExit 128+signum),
+    KeyboardInterrupt 130 (128+SIGINT), unknown otherwise."""
+    if isinstance(exc, KeyboardInterrupt):
+        return 130
+    code = getattr(exc, "code", None)
+    return code if isinstance(code, int) else None
+
+
+def _registry_patch(session_id, pid, **fields):
+    """Merge fields into this session+pid's RUNNING line. Best-effort, never
+    raises. True when a line changed, so the caller can retry a stamp that
+    raced its row into existence."""
+    try:
+        lines = []
+        changed = False
+        if os.path.exists(REGISTRY_PATH):
+            with open(REGISTRY_PATH) as f:
+                for line in f:
+                    try:
+                        data = json.loads(line)
+                    except Exception:
+                        lines.append(line)
+                        continue
+                    if (
+                        data.get("session") == session_id
+                        and data.get("pid") == pid
+                        and data.get("status") == "running"
+                    ):
+                        merged = dict(data)
+                        merged.update(fields)
+                        if merged != data:
+                            lines.append(json.dumps(merged) + "\n")
+                            changed = True
+                            continue
+                    lines.append(line)
+        if changed:
+            with open(REGISTRY_PATH, "w") as f:
+                f.writelines(lines)
+    except Exception:
+        pass
+
+
+def _launch_base_git(cwd):
+    """HEAD sha of the dispatch cwd at launch, best-effort (None when git is
+    unavailable or cwd is not a repo)."""
+    if not cwd:
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.strip() or None
+    except Exception:
+        pass
+    return None
+
+
+def _discovered_log_path(agent_dir, session_id):
+    """Best next transcript candidate from pi's sessions tree, or None.
+
+    pi never announces the transcript path over RPC (verified against the real
+    binary: no startup frame, no stderr line) and its filenames need not
+    contain the session id, so the client collects .jsonl files created since
+    launch, with this preference order:
+    1. filename contains the session id;
+    2. leading bytes (~16KB) contain the session id string (real pi writes
+       {"type":"session","id":...} as the first line, verified);
+    3. mtime-newest — the only tiebreak for transcripts that match neither;
+       two concurrent id-less content-less candidates remain ambiguous.
+    """
+    base = agent_dir or os.path.join(os.path.expanduser("~"), ".pi", "agent")
+    candidates = [
+        p
+        for p in glob.glob(os.path.join(base, "sessions", "*", "*.jsonl"))
+        if os.stat(p).st_mtime >= _LAUNCH_MONOTONIC_SKEW_FLOOR
+    ]
+    if not candidates:
+        return None
+    matching = [p for p in candidates if session_id and session_id in os.path.basename(p)]
+    if matching:
+        return max(matching, key=os.path.getmtime)
+    if session_id:
+        content_matches = [p for p in candidates if _content_contains(p, session_id)]
+        if content_matches:
+            return max(content_matches, key=os.path.getmtime)
+    return max(candidates, key=os.path.getmtime)
+
+
+def _write_deliverable(path, text):
+    """Auditor mode: the captured assistant text IS the observable output;
+    write it into the first require_edit path. False when the write failed
+    (the run then ends incomplete instead of claiming a delivery)."""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+        return True
+    except OSError:
+        return False
+
+
+def _lane_lock_path(session_id):
+    """Hold-point for one dispatch: <cwd>/.hermes/lane/LOCK/<session>.lock.
+
+    The cwd is embedded WHERE the dispatch runs, so the helper cannot know it
+    alone — callers pass the launch cwd. The dir lives under .hermes/lane,
+    inside the .gitignore region.
+    """
+    if not session_id:
+        return None
+    return os.path.join(".hermes", "lane", "LOCK", f"{session_id}.lock")
+
+
+def _lane_lock_acquire(session_id, cwd, model, pid):
+    """Atomically write this dispatch's lane lock. Best-effort, never raises."""
+    rel = _lane_lock_path(session_id)
+    if not rel or not cwd:
+        return
+    path = os.path.join(cwd, rel)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        import datetime
+
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(
+                {
+                    "session_id": session_id,
+                    "pid": pid,
+                    "model": model,
+                    "started_at": datetime.datetime.now().isoformat(),
+                },
+                f,
+            )
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _lane_lock_release(session_id, cwd):
+    """Remove this dispatch's own lock on any terminal exit. Best-effort."""
+    rel = _lane_lock_path(session_id)
+    if not rel or not cwd:
+        return
+    with contextlib.suppress(OSError):
+        os.remove(os.path.join(cwd, rel))
+
+
+def _content_contains(path, needle):
+    """True when needle appears in the file's first ~16KB. Best-effort; any
+    unreadable candidate simply cannot match."""
+    try:
+        with open(path, "rb") as f:
+            return needle.encode("utf-8") in f.read(16384)
+    except OSError:
+        return False
+
+
+def _registry_write(session_id, model, status, pid=None, exit_code=None):
     """Append/update the agent registry line. Never raises, never blocks dispatch."""
     try:
         import datetime
@@ -97,6 +265,8 @@ def _registry_write(session_id, model, status, pid=None):
             "status": status,
             "started": now,
         }
+        if exit_code is not None:
+            entry["exit_code"] = int(exit_code)
         if status in ("done", "error", "killed", "timeout"):
             entry["finished"] = now
             _registry_update_running(session_id, entry)
@@ -112,8 +282,10 @@ def _registry_update_running(session_id, entry):
     """Replace the running line matching session+pid.
 
     If the session+pid already has any terminal line (killed/dead/done), the
-    external terminal state wins and we do nothing; append only when the
-    session+pid has no line at all (crash-before-write case).
+    external terminal state wins and we do nothing; the running row being
+    replaced is merged with the terminal entry (additive keys like log_path
+    survive the swap); append only when the session+pid has no line at all
+    (crash-before-write case).
     """
     try:
         lines = []
@@ -130,7 +302,9 @@ def _registry_update_running(session_id, entry):
                     if data.get("session") == session_id and data.get("pid") == entry["pid"]:
                         exists = True
                         if not replaced and data.get("status") == "running":
-                            lines.append(json.dumps(entry) + "\n")
+                            merged = dict(data)
+                            merged.update(entry)
+                            lines.append(json.dumps(merged) + "\n")
                             replaced = True
                             continue
                     lines.append(line)
@@ -206,6 +380,8 @@ class PiRpcClient:
         self._frames_seen = 0
         self._last_beat = 0.0
         self._send_lock = threading.Lock()
+        self.log_path: str | None = None
+        self._log_path_stamped = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -274,14 +450,13 @@ class PiRpcClient:
                 self._frames.put(frame)
                 self._frames_seen += 1
                 self._drain_steer()
+                self._record_log_path()
                 self._heartbeat_tick()
 
     # -- protocol ----------------------------------------------------------
 
     def _log_frame(self, frame: dict) -> None:
         """Append every frame to PI_RPC_FRAMELOG (jsonl) when set: diagnosis aid."""
-        import os
-
         path = os.environ.get("PI_RPC_FRAMELOG")
         if not path:
             return
@@ -323,20 +498,61 @@ class PiRpcClient:
         except Exception:
             pass
 
+    def _record_log_path(self) -> None:
+        """Locate pi's real transcript once and stamp it into the running row.
+
+        Discovery runs until the first hit; the stamp retries while the running
+        row has no log_path yet, because the first frame can arrive before
+        main() has written that row. Every step is best-effort so discovery can
+        never break the dispatch. --no-session runs find nothing.
+        """
+        if self.no_session or not self.session_id:
+            return
+        if self.log_path is None:
+            found = _discovered_log_path(self.agent_dir, self.session_id)
+            if not found:
+                return
+            self.log_path = found
+        if self._log_path_stamped:
+            return
+        if _registry_patch(self.session_id, os.getpid(), log_path=self.log_path):
+            self._log_path_stamped = True
+
+    def stamp_log_path_into_registry(self) -> None:
+        """Bounded retry of the running-row stamp after main() wrote that row.
+
+        The ready frame usually beats the running write, so the first
+        _record_log_path call finds no row to patch; this gives it one short
+        window to land instead of waiting for frames the worker may never send.
+        """
+        deadline = time.monotonic() + 2.0
+        while not self._log_path_stamped and time.monotonic() < deadline:
+            self._record_log_path()
+            if self._log_path_stamped:
+                return
+            time.sleep(0.05)
+
     def _heartbeat_tick(self, force: bool = False) -> None:
-        """Stamp liveness for pi_manage list; one write per 5 s at most."""
+        """Stamp liveness for pi_manage list; one write per 5 s at most.
+
+        The stamp must survive the race where the first tick fires before
+        main() creates ~/.hermes/logs: the beat time advances only AFTER a
+        successful write, and the dir is ensured best-effort, so a failed
+        early tick is retried on the next frame instead of gone for 5 s.
+        """
         path = _heartbeat_file(self.session_id)
         if not path:
             return
         now = time.time()
         if not force and now - self._last_beat < 5.0:
             return
-        self._last_beat = now
         try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w") as f:
                 json.dump(
                     {"ts": now, "frames": self._frames_seen, "tools": len(self.tool_calls)}, f
                 )
+            self._last_beat = now
         except OSError:
             pass
 
@@ -429,10 +645,12 @@ class PiRpcClient:
                 self.tool_calls.append(str(item.get("name") or ""))
 
     def _digest(self, path: str) -> str:
+        # broad catch: a wide OSError AND a cwd-less client (TypeError from
+        # os.path.join); a hash miss must never take the dispatch down
         try:
             with open(os.path.join(self.cwd, path), "rb") as f:
                 return hashlib.sha256(f.read()).hexdigest()
-        except OSError:
+        except Exception:
             return ""
 
     def _satisfied(self, before: dict, min_tool_calls: int) -> bool:
@@ -456,6 +674,7 @@ class PiRpcClient:
         require_edit: str | None = None,
         min_tool_calls: int = 1,
         max_nudges: int = 3,
+        deliverable: bool = False,
     ) -> str:
         """Prompt, then verify that work happened; nudge in-session when it did not.
 
@@ -463,12 +682,16 @@ class PiRpcClient:
         worker returns with rc=0 having changed nothing. require_edit turns that
         into a detectable failure: the file hash must move, or the worker is told
         to act again in the same session.
+        deliverable=True is the auditor shape: min_tool_calls drops to 0 (text
+        output is the work) and min_tool_calls-style hash checks are skipped.
         """
         targets = [p.strip() for p in (require_edit or "").split(",") if p.strip()]
         before = {path: self._digest(path) for path in targets}
         deadline = time.monotonic() + WALL_TIMEOUT_S  # whole run: prompt + nudges
         out = self.prompt(text, timeout_s=timeout_s, deadline=deadline)
         while not self._satisfied(before, min_tool_calls):
+            if deliverable:
+                break  # text IS the work; no hash gate, no nudges
             if self.nudges >= max_nudges:
                 break
             if time.monotonic() >= deadline:  # wall exhausted: no nudge retry
@@ -476,7 +699,9 @@ class PiRpcClient:
             self.nudges += 1
             out += f"\n--- nudge {self.nudges} ---\n"
             out += self._nudge(self._nudge_text(targets), timeout_s, deadline)
-        self.satisfied = self._satisfied(before, min_tool_calls)
+        self.satisfied = (
+            self._satisfied(before, min_tool_calls) if not deliverable else bool(targets)
+        )
         return out
 
     def _nudge(self, text: str, timeout_s: float, deadline: float | None = None) -> str:
@@ -654,6 +879,16 @@ def main(argv: list[str] | None = None) -> int:
         help="tool calls required before the run counts as work (default 1)",
     )
     parser.add_argument(
+        "--auditor-deliverable",
+        action="store_true",
+        default=False,
+        dest="auditor_deliverable",
+        help=(
+            "text-deliverable run: final assistant text is written into the first "
+            "require_edit path at completion; no nudge loop"
+        ),
+    )
+    parser.add_argument(
         "--max-nudges",
         type=int,
         default=3,
@@ -682,6 +917,8 @@ def main(argv: list[str] | None = None) -> int:
         no_session=args.no_session,
         agent_dir=args.agent_dir,
     )
+    deliverable_paths = [p.strip() for p in (args.require_edit or "").split(",") if p.strip()]
+    is_auditor = bool(args.auditor_deliverable)
     stale_steer = _steer_file(args.session_id)
     if stale_steer:
         # a fresh dispatch must not inherit a steer message aimed at a dead run
@@ -689,14 +926,26 @@ def main(argv: list[str] | None = None) -> int:
             os.remove(stale_steer)
     client.start()
     _registry_write(args.session_id or "unnamed", args.model, "running")
+    _launch_facts = {"cwd": args.cwd, "base": _launch_base_git(args.cwd)}
+    _registry_patch(
+        args.session_id or "unnamed",
+        os.getpid(),
+        **{k: v for k, v in _launch_facts.items() if v},
+    )
+    _lane_lock_acquire(args.session_id or "unnamed", args.cwd, args.model, os.getpid())
     status = "done"
+    exit_code = 0
     try:
+        # Inside the guarded region: a SIGTERM during the bounded stamp loop
+        # must still reach the finally below, or the killed line never lands.
+        client.stamp_log_path_into_registry()
         text = client.run(
             args.prompt,
             timeout_s=args.timeout_s or DEFAULT_TIMEOUT_S,
             require_edit=args.require_edit,
             min_tool_calls=args.min_tool_calls,
             max_nudges=args.max_nudges,
+            deliverable=is_auditor,
         )
         sys.stdout.write(text)
         if not text.endswith("\n"):
@@ -706,17 +955,28 @@ def main(argv: list[str] | None = None) -> int:
             f"[pi] tool_calls={len(client.tool_calls)} nudges={client.nudges} "
             f"satisfied={client.satisfied}{steered_note}\n"
         )
+        if is_auditor:
+            wrote = _write_deliverable(deliverable_paths[0], text) if deliverable_paths else False
+            if not wrote:
+                # the text was the deliverable: a failed write means nothing landed
+                status = "incomplete"
+                exit_code = 3
+                sys.stderr.write("[pi] auditor deliverable write failed\n")
         if not client.satisfied:
             status = "incomplete"
+            exit_code = 3
     except TimeoutError:
         status = "timeout"
+        exit_code = None
         raise
-    except BaseException:  # SystemExit (SIGTERM), KeyboardInterrupt = killed
+    except BaseException as exc:  # SystemExit (SIGTERM), KeyboardInterrupt = killed
         status = "killed"
+        exit_code = _killed_exit_code(exc)
         raise
     finally:
-        _registry_write(args.session_id or "unnamed", args.model, status)
+        _registry_write(args.session_id or "unnamed", args.model, status, exit_code=exit_code)
         client.close()
+        _lane_lock_release(args.session_id or "unnamed", args.cwd)
     return 0 if status == "done" else 3
 
 
