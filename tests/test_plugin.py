@@ -425,6 +425,8 @@ def test_pi_launch_drops_plugin_fresh_when_module_is_stale(monkeypatch):
 def test_generated_command_single_line_and_parseable():
     """All worker types: single line, no backslash escapes,
     balanced quotes, shlex-parsable, contains --session-id and --prompt."""
+    with open(os.path.join(TMP_CWD, "audit.md"), "w") as f:
+        f.write("anchor\n")
     for wt in WORKER_TYPES:
         result = _parse(
             pi_launch(
@@ -436,6 +438,7 @@ def test_generated_command_single_line_and_parseable():
                     "cwd": TMP_CWD,
                     "epic_id": "epicX",
                     "mode": "standard",
+                    **({"require_edit": "audit.md"} if wt == "auditor" else {}),
                 }
             )
         )
@@ -890,6 +893,7 @@ def test_cwd_flag_in_generated_command_all_worker_types():
                     "contract_path": CONTRACT_MD,
                     "cwd": TMP_CWD,
                     "epic_id": "epicCwd",
+                    **({"require_edit": "audit.md"} if wt == "auditor" else {}),
                 }
             )
         )
@@ -2745,3 +2749,161 @@ def test_lane_lock_stale_after_crash_surfaced_and_reported(tmp_path):
     # the action itself deletes nothing
     assert os.path.exists(lock_path)
     _teardown_registry()
+
+
+def _auditor_launch(**over):
+    """One marked-cwd auditor launch skeleton with an existing anchor."""
+    proj = tempfile.mkdtemp(prefix="pi-delegation-auditor-")
+    with open(os.path.join(proj, "AGENTS.md"), "w") as f:
+        f.write("test repo marker\n")
+    with open(os.path.join(proj, "review-report.md"), "w") as f:
+        f.write("empty\n")
+    base = dict(
+        worker_type="auditor",
+        skills=[],
+        contract_path=_contract_file(),
+        cwd=proj,
+        model="anything",
+        epic_id="epicAuditor",
+        require_edit=[os.path.join(proj, "review-report.md")],
+    )
+    result = p._pi_launch_impl(**{**base, **over})
+    return result, proj
+
+
+def test_auditor_argv_carries_deliverable_toolset():
+    result, proj = _auditor_launch(min_tool_calls=1, max_nudges=0)
+    assert "error" not in result, result
+    assert "--tools read,grep,find,ls,write,edit" in result["command"]
+    assert "--codemode" not in result["command"], result["command"]
+    assert "--require-edit" in result["command"] and "review-report.md" in result["command"], result
+    shutil.rmtree(proj, ignore_errors=True)
+
+
+def test_auditor_without_require_edit_errors_at_preflight():
+    cmd = str(tempfile.mkdtemp())
+    with open(os.path.join(cmd, "AGENTS.md"), "w") as f:
+        f.write("m\n")
+    result = _parse(
+        p._pi_launch_impl(
+            worker_type="auditor",
+            skills=[],
+            contract_path=_contract_file(),
+            cwd=cmd,
+            model="m2",
+            epic_id="epicAuditorNoAim",
+        )
+    )
+    assert "error" in result, result
+    assert "auditor" in result["error"].lower(), result["error"]
+    assert "deliverable" in result["error"].lower(), result["error"]
+    shutil.rmtree(cmd, ignore_errors=True)
+
+
+def test_auditor_final_text_written_to_require_edit_at_done(tmp_path):
+    """Real subprocess client (auditor-style run): capture-into-deliverable on
+    done keeps integrity: status done + exit_code 0 + the text file filled."""
+    import pi_rpc_client as pmod
+
+    ack_frame = (
+        '{"type":"response","command":"prompt","success":true,"data":{"disposition":"started"}}'
+    )
+    end_frame = (
+        '{"type":"agent_end","messages":[{"role":"assistant","content":'
+        '[{"type":"text","text":"AUDIT FINAL REPORT: OK"}]}]}'
+    )
+    fake_pi_sh = (
+        "#!/bin/sh\nsleep 0.2\n"
+        "printf '%s\\n' '{\"type\":\"ready\"}'\n"
+        f"printf '%s\\n' '{ack_frame}'\n"
+        f"printf '%s\\n' '{end_frame}'\n"
+        "exec sleep 30\n"
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_pi = bin_dir / "pi"
+    fake_pi.write_text(fake_pi_sh)
+    fake_pi.chmod(0o755)
+    deliverable = tmp_path / "review-report.md"
+    deliverable.write_text("empty\n")
+    (tmp_path / ".hermes" / "logs").mkdir(parents=True)
+    pmod.REGISTRY_PATH = str(tmp_path / ".hermes" / "logs" / "pi-agents.jsonl")
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            p.CLIENT_PATH,
+            "--session-id",
+            "task-audit-default",
+            "--model",
+            "m2",
+            "--prompt",
+            "review things",
+            "--timeout",
+            "60",
+            "--require-edit",
+            str(deliverable),
+            "--min-tool-calls",
+            "0",
+            "--max-nudges",
+            "0",
+            "--auditor-deliverable",
+            "--agent-dir",
+            str(tmp_path / "agent-worker"),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={
+            **os.environ,
+            "HOME": str(tmp_path),
+            "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            "PYTHONPATH": os.pathsep.join(
+                [
+                    os.path.dirname(os.path.abspath(__file__)),
+                    os.path.dirname(p.CLIENT_PATH),
+                    os.environ.get("PYTHONPATH", ""),
+                ]
+            ),
+        },
+    )
+    try:
+        rc = child.wait(timeout=20)
+        assert rc == 0, rc
+        assert (
+            deliverable.read_text() == "AUDIT FINAL REPORT: OK\n"
+            or deliverable.read_text().startswith("AUDIT FINAL REPORT")
+        ), deliverable.read_text()
+        with open(pmod.REGISTRY_PATH) as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+        terminal = rows[-1]
+        assert terminal["status"] == "done", rows
+        assert terminal["exit_code"] == 0, terminal
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            child.wait(timeout=10)
+
+
+def test_auditor_wait_reports_done_exit_code(tmp_path):
+    """pi_manage wait on the auditor row: finished true, done, exit_code 0."""
+    proj = tempfile.mkdtemp(prefix="pi-delegation-auditor-wait-")
+    with open(os.path.join(proj, "AGENTS.md"), "w") as f:
+        f.write("m\n")
+    with open(os.path.join(proj, "review.md"), "w") as f:
+        f.write("x\n")
+    _setup_registry(proj)
+    try:
+        _write_registry(
+            {
+                "session": "epicAuditorWait-coder",
+                "pid": 999999,
+                "status": "done",
+                "exit_code": 0,
+                "started": "2024-01-01T00:00:00",
+            }
+        )
+        result = _parse(pi_manage({"action": "wait", "session_id": "epicAuditorWait-coder"}))
+        assert result["finished"] is True and result["status"] == "done", result
+        assert result["exit_code"] == 0, result
+    finally:
+        _teardown_registry()
+        shutil.rmtree(proj, ignore_errors=True)

@@ -181,6 +181,19 @@ def _discovered_log_path(agent_dir, session_id):
     return max(candidates, key=os.path.getmtime)
 
 
+def _write_deliverable(path, text):
+    """Auditor mode: the captured assistant text IS the observable output;
+    write it into the first require_edit path. False when the write failed
+    (the run then ends incomplete instead of claiming a delivery)."""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+        return True
+    except OSError:
+        return False
+
+
 def _lane_lock_path(session_id):
     """Hold-point for one dispatch: <cwd>/.hermes/lane/LOCK/<session>.lock.
 
@@ -627,10 +640,12 @@ class PiRpcClient:
                 self.tool_calls.append(str(item.get("name") or ""))
 
     def _digest(self, path: str) -> str:
+        # broad catch: a wide OSError AND a cwd-less client (TypeError from
+        # os.path.join); a hash miss must never take the dispatch down
         try:
             with open(os.path.join(self.cwd, path), "rb") as f:
                 return hashlib.sha256(f.read()).hexdigest()
-        except OSError:
+        except Exception:
             return ""
 
     def _satisfied(self, before: dict, min_tool_calls: int) -> bool:
@@ -654,6 +669,7 @@ class PiRpcClient:
         require_edit: str | None = None,
         min_tool_calls: int = 1,
         max_nudges: int = 3,
+        deliverable: bool = False,
     ) -> str:
         """Prompt, then verify that work happened; nudge in-session when it did not.
 
@@ -661,12 +677,16 @@ class PiRpcClient:
         worker returns with rc=0 having changed nothing. require_edit turns that
         into a detectable failure: the file hash must move, or the worker is told
         to act again in the same session.
+        deliverable=True is the auditor shape: min_tool_calls drops to 0 (text
+        output is the work) and min_tool_calls-style hash checks are skipped.
         """
         targets = [p.strip() for p in (require_edit or "").split(",") if p.strip()]
         before = {path: self._digest(path) for path in targets}
         deadline = time.monotonic() + WALL_TIMEOUT_S  # whole run: prompt + nudges
         out = self.prompt(text, timeout_s=timeout_s, deadline=deadline)
         while not self._satisfied(before, min_tool_calls):
+            if deliverable:
+                break  # text IS the work; no hash gate, no nudges
             if self.nudges >= max_nudges:
                 break
             if time.monotonic() >= deadline:  # wall exhausted: no nudge retry
@@ -674,7 +694,9 @@ class PiRpcClient:
             self.nudges += 1
             out += f"\n--- nudge {self.nudges} ---\n"
             out += self._nudge(self._nudge_text(targets), timeout_s, deadline)
-        self.satisfied = self._satisfied(before, min_tool_calls)
+        self.satisfied = (
+            self._satisfied(before, min_tool_calls) if not deliverable else bool(targets)
+        )
         return out
 
     def _nudge(self, text: str, timeout_s: float, deadline: float | None = None) -> str:
@@ -852,6 +874,16 @@ def main(argv: list[str] | None = None) -> int:
         help="tool calls required before the run counts as work (default 1)",
     )
     parser.add_argument(
+        "--auditor-deliverable",
+        action="store_true",
+        default=False,
+        dest="auditor_deliverable",
+        help=(
+            "text-deliverable run: final assistant text is written into the first "
+            "require_edit path at completion; no nudge loop"
+        ),
+    )
+    parser.add_argument(
         "--max-nudges",
         type=int,
         default=3,
@@ -880,6 +912,8 @@ def main(argv: list[str] | None = None) -> int:
         no_session=args.no_session,
         agent_dir=args.agent_dir,
     )
+    deliverable_paths = [p.strip() for p in (args.require_edit or "").split(",") if p.strip()]
+    is_auditor = bool(args.auditor_deliverable)
     stale_steer = _steer_file(args.session_id)
     if stale_steer:
         # a fresh dispatch must not inherit a steer message aimed at a dead run
@@ -906,6 +940,7 @@ def main(argv: list[str] | None = None) -> int:
             require_edit=args.require_edit,
             min_tool_calls=args.min_tool_calls,
             max_nudges=args.max_nudges,
+            deliverable=is_auditor,
         )
         sys.stdout.write(text)
         if not text.endswith("\n"):
@@ -915,6 +950,13 @@ def main(argv: list[str] | None = None) -> int:
             f"[pi] tool_calls={len(client.tool_calls)} nudges={client.nudges} "
             f"satisfied={client.satisfied}{steered_note}\n"
         )
+        if is_auditor:
+            wrote = _write_deliverable(deliverable_paths[0], text) if deliverable_paths else False
+            if not wrote:
+                # the text was the deliverable: a failed write means nothing landed
+                status = "incomplete"
+                exit_code = 3
+                sys.stderr.write("[pi] auditor deliverable write failed\n")
         if not client.satisfied:
             status = "incomplete"
             exit_code = 3

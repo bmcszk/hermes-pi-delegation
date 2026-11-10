@@ -32,7 +32,14 @@ WORKER_TYPES = {
         "thinking": "high",
     },
     "coder": {"tools": None, "use_codemode": True, "thinking": None},
-    "auditor": {"tools": None, "use_codemode": True, "thinking": None},
+    # text-deliverable review jobs: writes its report to the require_edit
+    # deliverable file; no shell, no codemode. nudge gate off by default.
+    "auditor": {
+        "tools": "read,grep,find,ls,write,edit",
+        "use_codemode": False,
+        "thinking": None,
+        "text_deliverable": True,
+    },
 }
 
 # Parent-side git-mutation deny: only when the command targets a git binary
@@ -871,6 +878,7 @@ def _preflight(
     wall_timeout_s,
     min_tool_calls,
     max_nudges,
+    worker_type="default",
 ):
     """Fail-fast contract and budget checks before a worker spawns.
 
@@ -918,6 +926,11 @@ def _preflight(
             f"budgets - wall_timeout_s ({wall_timeout_s}) must exceed timeout_s ({timeout_s})"
         )
     min_max_passed = min_tool_calls is not _UNSET or max_nudges is not _UNSET
+    if worker_type == "auditor" and not require_edit:
+        failures.append(
+            "auditor - mode aims at no deliverable: require_edit names the file the "
+            "final text is written into"
+        )
     min_calls = 0 if min_tool_calls is _UNSET else int(min_tool_calls or 0)
     max_nudges = 0 if max_nudges is _UNSET else int(max_nudges or 0)
     if max_nudges > 0 and min_calls < 1:
@@ -1033,6 +1046,7 @@ def _pi_launch_impl(
             wall_timeout_s,
             min_tool_calls,
             max_nudges,
+            worker_type,
         )
         + preflight_skill_failures
     )
@@ -1078,6 +1092,8 @@ def _pi_launch_impl(
         )
     if cfg["use_codemode"]:
         parts.append("--codemode")
+    if cfg.get("text_deliverable"):
+        parts.append("--auditor-deliverable")
     if cfg["tools"]:
         parts.extend(["--tools", cfg["tools"]])
     if cfg["thinking"]:
@@ -1105,8 +1121,12 @@ def _pi_launch_impl(
 
     if require_edit:
         targets = require_edit if isinstance(require_edit, str) else ",".join(require_edit)
-        min_calls = 3 if min_tool_calls is _UNSET else int(min_tool_calls)
-        max_nudges_resolved = 4 if max_nudges is _UNSET else int(max_nudges)
+        if worker_type == "auditor":
+            min_calls = 1 if min_tool_calls is _UNSET else int(min_tool_calls)
+            max_nudges_resolved = 0 if max_nudges is _UNSET else int(max_nudges)
+        else:
+            min_calls = 3 if min_tool_calls is _UNSET else int(min_tool_calls)
+            max_nudges_resolved = 4 if max_nudges is _UNSET else int(max_nudges)
         nudge_clause = (
             "nudge: 0 - no correction loop"
             if max_nudges_resolved == 0

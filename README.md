@@ -32,15 +32,15 @@ Generates one worker dispatch.
 | `timeout_s` | no | Idle budget per dispatch. Defaults to `PI_WORKER_TIMEOUT_S`, 900 s. |
 | `wall_timeout_s` | no | Hard ceiling on the whole dispatch. Defaults to `max(3600, timeout_s + 900)`. |
 
-Worker types carry tool policy only:
+Worker types carry tool policy; what each is FOR and what its deliverable is:
 
-| Worker type | Tools | codemode | thinking |
-| --- | --- | --- | --- |
-| `default` | pi defaults | no | pi default |
-| `reasoner` | `read,grep,find,ls` | no | high |
-| `brainer` | `read,grep,find,ls,write,edit` | no | high |
-| `coder` | pi defaults | yes | pi default |
-| `auditor` | pi defaults | yes | pi default |
+| Worker type | Purpose | Deliverable | Tools | codemode | thinking |
+| --- | --- | --- | --- | --- | --- |
+| `default` | passthrough dispatch | whatever the run's work produces | pi defaults | no | pi default |
+| `reasoner` | read-only analysis, opinions in the reply text | reply text | `read,grep,find,ls` | no | high |
+| `brainer` | light edits + short docs | edited files + reply text | `read,grep,find,ls,write,edit` | no | high |
+| `coder` | implementation work | edited files (nudge-gated) | pi defaults | yes | pi default |
+| `auditor` | review/triage jobs under the SAME registry and pi_manage surfaces (list, wait, kill, steer, logs via log_path, salvage_report) — runs as a real dispatch with a row, heartbeats and log_path. Go-to for text-deliverable jobs: the final assistant TEXT is the run's only observable output, so it is written into the first `require_edit` path at completion. The text lands on status done; a failed deliverable write downgrades to `incomplete` (exit 3). Full client-side tracking and management machinery work for it. | text written into the first `require_edit` path | `read,grep,find,ls,write,edit` | no | pi default |
 
 ### `pi_manage`
 
