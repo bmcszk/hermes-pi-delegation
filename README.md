@@ -42,6 +42,21 @@ Worker types carry tool policy; what each is FOR and what its deliverable is:
 | `coder` | implementation work | edited files (nudge-gated) | pi defaults | yes | pi default |
 | `auditor` | review/triage jobs under the SAME registry and pi_manage surfaces (list, wait, kill, steer, logs via log_path, salvage_report) — runs as a real dispatch with a row, heartbeats and log_path. Go-to for text-deliverable jobs: the final assistant TEXT is the run's only observable output, so it is written into the first `require_edit` path at completion. The text lands on status done; a failed deliverable write downgrades to `incomplete` (exit 3). Full client-side tracking and management machinery work for it. | text written into the first `require_edit` path | `read,grep,find,ls,write,edit` | no | pi default |
 
+### One-shot dispatch (`auto=true`)
+
+`pi_launch` accepted `auto`: with it, the launcher runs the generated
+command itself as a DETACHED background process (its own process group —
+the kill path stays exact) and returns
+`{dispatched: true, pid, session_id, log}` where `log` is
+`<cwd>/.hermes/lane/<session_id>.log`, holding the worker's combined
+stdout+stderr (preflight + budget echoes included). The paste path
+(`auto=false`, the default) is unchanged: the command comes back as a
+string and NOTHING spawns. Preflight still runs FIRST either way — a
+preflight failure emits no process in both modes. Truth lives in the
+registry: `wait`/`list`/`kill` work on an auto-dispatched worker exactly
+like a pasted one, and the log file is the belt-and-suspenders view over
+`logs` (log_path).
+
 ### `pi_manage`
 
 Registry and process control for running workers.

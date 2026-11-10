@@ -245,6 +245,14 @@ def _tool_schema(name, description, properties, required):
 
 
 LAUNCH_PARAMS = {
+    "auto": {
+        "type": "boolean",
+        "description": (
+            "run the generated command yourself as a detached background dispatch and "
+            "return dispatched/pid/session_id/log; default false keeps the paste-able "
+            "command output (no process spawned)"
+        ),
+    },
     "create_anchor": {
         "type": "boolean",
         "description": (
@@ -733,6 +741,34 @@ def _salvage_report(session_id, lines=12):
     }
 
 
+def _dispatch_command(command, cwd, session_id):
+    """auto=true: run the generated one-liner detached, log to the lane dir.
+
+    bash -c receives the EXACT emitted command (preflight echo + budget echo
+    + client) with stdout/stderr into <cwd>/.hermes/lane/<session_id>.log;
+    the redirect keeps the parent's stdout clean. start_new_session detaches
+    the worker's process group so the kill path (client pid pgid) stays exact
+    and a gateway restart cannot take the worker down. Best-effort: a spawn
+    failure returns the error shape instead of raising.
+    """
+    log_dir = os.path.join(cwd, ".hermes", "lane")
+    log_path = os.path.join(log_dir, f"{session_id}.log")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        with open(log_path, "w") as log:
+            proc = subprocess.Popen(
+                ["bash", "-c", command],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                cwd=cwd,
+                start_new_session=True,
+            )
+    except OSError as exc:
+        return {"error": f"$dispatch failed to spawn: {exc}", "log": log_path}
+    return {"dispatched": True, "pid": proc.pid, "session_id": session_id, "log": log_path}
+
+
 def _doctor():
     """Read-only snapshot of plugin-vs-gateway state; the first-class staleness answer."""
     health = _plugin_health()
@@ -970,6 +1006,7 @@ def _pi_launch_impl(
     timeout_s=None,
     wall_timeout_s=None,
     create_anchor=False,
+    auto=False,
     **_,
 ):
     """Generate a single-line POSIX shell command for pi_rpc_client.py.
@@ -1156,6 +1193,8 @@ def _pi_launch_impl(
         "worker_type": worker_type,
         "mode": mode,
     }
+    if auto:
+        return _dispatch_command(command, cwd, session_id)
     if system_prompt is not None:
         result["system_prompt"] = system_prompt
     if warnings:

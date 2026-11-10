@@ -2,6 +2,7 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -2593,6 +2594,7 @@ def test_doctor_schema_missing_empty_with_create_anchor():
     report = p._pi_manage_impl(action="doctor")
     assert report["schema_missing"] == []
     assert "create_anchor" in report["registered_props"], report["registered_props"]
+    assert "auto" in report["registered_props"], report["registered_props"]
 
 
 def _budget_launch(**over):
@@ -2907,3 +2909,103 @@ def test_auditor_wait_reports_done_exit_code(tmp_path):
     finally:
         _teardown_registry()
         shutil.rmtree(proj, ignore_errors=True)
+
+
+def _auto_launch_env(tmp_path):
+    """A fake pi + fake HOME: launcher-spawned clients frame against it."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    ack = '{"type":"response","command":"prompt","success":true,"data":{"disposition":"started"}}'
+    end = (
+        '{"type":"agent_end","messages":[{"role":"assistant","content":'
+        '[{"type":"text","text":"AUTO DISPATCH OK"}]}]}'
+    )
+    fake_pi = bin_dir / "pi"
+    fake_pi.write_text(
+        "#!/bin/sh\nsleep 0.2\n"
+        f"printf '%s\\n' '{ack}'\n"
+        "printf '%s\\n' '{\"type\":\"ready\"}'\n"
+        f"printf '%s\\n' '{end}'\n"
+        "exec sleep 30\n"
+    )
+    fake_pi.chmod(0o755)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "AGENTS.md").write_text("marker\n")
+    return str(bin_dir), str(proj)
+
+
+def _auto_launch_kwargs(bin_dir, proj):
+    contract = os.path.join(proj, "contract.md")
+    with open(contract, "w") as f:
+        f.write("worker contract\n")
+    with open(os.path.join(proj, "a.go"), "w") as f:
+        f.write("package main\n")
+    return {
+        "worker_type": "coder",
+        "skills": [],
+        "contract_path": contract,
+        "cwd": proj,
+        "epic_id": "epicAuto",
+    }
+
+
+def test_launch_auto_true_dispatches_and_registers(tmp_path, monkeypatch):
+    bin_dir, proj = _auto_launch_env(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    batter = _auto_launch_kwargs(bin_dir, proj)
+    result = _parse(pi_launch({**batter, "auto": True}))
+    assert "error" not in result, result
+    assert result.get("dispatched") is True, result
+    assert isinstance(result.get("pid"), int), result
+    assert result["session_id"] == "epicAuto-coder"
+    log_path = result.get("log")
+    assert log_path and os.path.exists(log_path), result
+
+    p.REGISTRY_PATH = os.path.join(str(tmp_path), ".hermes", "logs", "pi-agents.jsonl")
+
+    def _row():
+        if not os.path.exists(p.REGISTRY_PATH):
+            return None
+        with open(p.REGISTRY_PATH) as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+        return next((r for r in rows if r.get("session") == "epicAuto-coder"), None)
+
+    row = _wait_for_registry(_row)
+    assert row and row["status"] == "running", row
+    os.kill(result["pid"], signal.SIGTERM)
+
+
+def test_launch_auto_false_prints_command_only(tmp_path, monkeypatch):
+    import shlex as _shlex
+
+    bin_dir, proj = _auto_launch_env(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+    result = _parse(pi_launch(_auto_launch_kwargs(bin_dir, proj)))
+    assert "error" not in result, result
+    assert "dispatched" not in result and "pid" not in result, result
+    cmd = result["command"]
+    assert "\n" not in cmd and cmd.startswith("echo 'preflight"), result
+    assert _shlex.split(cmd)
+
+
+def test_launch_auto_true_with_preflight_failure_spawns_nothing(tmp_path, monkeypatch):
+    bin_dir, proj = _auto_launch_env(tmp_path)
+    kwargs = _auto_launch_kwargs(bin_dir, proj)
+    kwargs["require_edit"] = os.path.join(proj, "anchor-does-not-exist.md")
+    result = _parse(pi_launch({**kwargs, "auto": True}))
+    assert result.get("error", "").startswith("preflight"), result
+    assert "dispatched" not in result and "pid" not in result, result
+    # no process landed
+    objs = subprocess.run(["ps", "-eo", "args"], capture_output=True, text=True).stdout
+    assert "pi_rpc_client.py" not in objs or "epicAuto" not in objs
+
+
+def test_launch_auto_no_contract_spawns_nothing(tmp_path, monkeypatch):
+    bin_dir, proj = _auto_launch_env(tmp_path)
+    kwargs = _auto_launch_kwargs(bin_dir, proj)
+    kwargs["contract_path"] = os.path.join(proj, "missing-contract.md")
+    result = _parse(pi_launch({**kwargs, "auto": True}))
+    assert result.get("error", "").startswith("preflight"), result
+    assert "dispatched" not in result, result
