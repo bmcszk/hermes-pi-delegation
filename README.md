@@ -68,9 +68,18 @@ rc=$?; echo "TAG=$rc"; exit $rc
 The client also writes its true terminal status (`done`, `incomplete`,
 `timeout`, `killed`) plus `exit_code` into the registry, so the real outcome is
 readable regardless of the wrapper: `pi_manage` `list` and `wait` surface the
-terminal `exit_code` (`0` done, `3` incomplete, `143` SIGTERM). `pi_manage`
-`kill` stamps `exit_code: 143` itself, since the killed client never gets to
-write.
+terminal `exit_code`. `pi_manage` `kill` stamps `exit_code: 143` itself, since
+the killed client never gets to write.
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | done: dispatch satisfied |
+| 3 | incomplete: correction budget exhausted (nudged out) |
+| 130 | KeyboardInterrupt (Ctrl-C) |
+| 143 | SIGTERM (external kill; kill action stamps 143 itself) |
+
+Other non-signal failures exit per Python conventions (traceback to stderr,
+non-zero).
 
 ### Worker isolation directory
 

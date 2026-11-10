@@ -449,13 +449,16 @@ def test_generated_command_single_line_and_parseable():
         parts = [CONTRACT_MD if v.startswith("$(cat") else v for v in parts]
         assert "--session-id" in parts, wt
         assert "--prompt" in parts, wt
-        # the emitted line starts with the preflight ok note, then the client
+        # the emitted line starts with the preflight + budget notes, then the client
         assert parts[0] == "echo", wt
         assert parts[1].endswith(
             "preflight ok: contract, require_edit anchors, skills, budgets, cwd"
         ), wt
         assert parts[2] == "&&", wt
-        assert parts[3] == "python3", wt
+        assert parts[3] == "echo", wt
+        assert parts[4].startswith("budget: per-call <="), wt
+        assert parts[5] == "&&", wt
+        assert parts[6] == "python3", wt
 
 
 def test_prompt_substitution_not_quoted_away():
@@ -2585,3 +2588,76 @@ def test_doctor_schema_missing_empty_with_create_anchor():
     report = p._pi_manage_impl(action="doctor")
     assert report["schema_missing"] == []
     assert "create_anchor" in report["registered_props"], report["registered_props"]
+
+
+def _budget_launch(**over):
+    """One marked-cwd launch with explicit budgets, returning the parsed result."""
+    proj = tempfile.mkdtemp(prefix="pi-delegation-budget-")
+    with open(os.path.join(proj, "AGENTS.md"), "w") as f:
+        f.write("test repo marker\n")
+    with open(os.path.join(proj, "a.go"), "w") as f:
+        f.write("package main\n")
+    base = dict(
+        worker_type="coder",
+        skills=[],
+        contract_path=_contract_file(),
+        cwd=proj,
+        model="anything",
+        epic_id="epicBudget",
+        require_edit=[os.path.join(proj, "a.go")],
+    )
+    result = p._pi_launch_impl(**{**base, **over})
+    cleanup = proj
+    return result, cleanup
+
+
+def test_budget_line_carries_resolved_numbers():
+    result, proj = _budget_launch(
+        timeout_s=600, wall_timeout_s=2400, min_tool_calls=3, max_nudges=2
+    )
+    assert "error" not in result, result
+    cmd = result["command"]
+    assert "budget: per-call <= 600s" in cmd, cmd
+    assert "wall <= 2400s" in cmd, cmd
+    assert "nudge: >=3 tool calls, <=2 nudges then exit 3" in cmd, cmd
+    shutil.rmtree(proj, ignore_errors=True)
+
+
+def test_budget_line_zero_nudge_form():
+    result, proj = _budget_launch(max_nudges=0, min_tool_calls=1)
+    assert "error" not in result, result
+    cmd = result["command"]
+    assert "nudge: 0 - no correction loop" in cmd, cmd
+    assert "wall <=" in cmd and "per-call <=" in cmd, cmd
+    shutil.rmtree(proj, ignore_errors=True)
+
+
+def test_budget_line_defaults_when_unspecified():
+    result, proj = _budget_launch()
+    assert "error" not in result, result
+    cmd = result["command"]
+    # resolved wall defaults to max(3600, timeout+900), idle default 900
+    assert "budget: per-call <= 900s" in cmd, cmd
+    assert "wall <= 3600s" in cmd, cmd
+    assert "nudge: >=3 tool calls, <=4 nudges then exit 3" in cmd, cmd
+    shutil.rmtree(proj, ignore_errors=True)
+
+
+def test_budget_line_before_client_invocation_single_line():
+    result, proj = _budget_launch(timeout_s=330, wall_timeout_s=3300)
+    assert "error" not in result, result
+    cmd = result["command"]
+    assert "\n" not in cmd, cmd
+    budget_pos = cmd.index("budget: per-call")
+    client_pos = cmd.index("python3", budget_pos)
+    assert budget_pos < client_pos
+    shutil.rmtree(proj, ignore_errors=True)
+
+
+def test_readme_exit_code_table_covers_3_and_143():
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "README.md")) as f:
+        readme = f.read()
+    assert "| 3 | incomplete: correction budget exhausted (nudged out) |" in readme
+    assert "| 143 | SIGTERM (external kill; kill action stamps 143 itself) |" in readme
+    assert "| 0 | done: dispatch satisfied |" in readme
+    assert "| 130 | KeyboardInterrupt (Ctrl-C) |" in readme

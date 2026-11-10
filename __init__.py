@@ -1066,19 +1066,24 @@ def _pi_launch_impl(
         targets = require_edit if isinstance(require_edit, str) else ",".join(require_edit)
         min_calls = 3 if min_tool_calls is _UNSET else int(min_tool_calls)
         max_nudges_resolved = 4 if max_nudges is _UNSET else int(max_nudges)
+        nudge_clause = (
+            "nudge: 0 - no correction loop"
+            if max_nudges_resolved == 0
+            else f"nudge: >={min_calls} tool calls, <={max_nudges_resolved} nudges then exit 3"
+        )
         parts.extend(["--require-edit", targets])
         parts.extend(["--min-tool-calls", str(min_calls)])
         parts.extend(["--max-nudges", str(max_nudges_resolved)])
-    elif min_tool_calls is not _UNSET or max_nudges is not _UNSET:
-        return {
-            "error": (
-                "min_tool_calls/max_nudges require require_edit "
-                "(the gate is inert without an edit target)"
-            )
-        }
+    else:
+        # preflight already refuses min/max without require_edit
+        nudge_clause = "nudge: 0 - no correction loop"
     parts.extend(["--prompt", f"$(cat {shlex.quote(contract_path)})"])
 
     command = "echo 'preflight ok: contract, require_edit anchors, skills, budgets, cwd' && "
+    budget_note = (
+        f"budget: per-call <= {resolved_timeout}s, wall <= {resolved_wall}s, {nudge_clause}"
+    )
+    command += f"echo {shlex.quote(budget_note)} && "
     command += " ".join(shlex.quote(p) for p in parts[:-1])
     # Last part keeps $(cat ...) unquoted at the outer level: shlex.quote would
     # suppress substitution, so emit it double-quoted manually.
