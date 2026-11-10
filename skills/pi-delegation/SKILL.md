@@ -91,8 +91,9 @@ edits is the opposite trap: believe the tree, not the words.
 - Tasks and bugs land TDD: the coder writes the failing tests against the
   unfixed tree first, records the RED run as evidence, then lands only the
   change that turns them green.
-- The ledger belongs to the orchestrator: a worker never touches `.beans/`
-  state or statuses; claims, PoW, and closure gates stay with the parent.
+- The ledger belongs to the orchestrator: a worker never touches the task
+  tracker's state files - statuses, claims, evidence. Closure gates stay
+  with the parent.
 - `require_edit` takes one exact file path, never a directory.
 - Aim `require_edit` at a file the contract itself orders the worker to
   create or modify; aiming it at files whose edits predate the dispatch
