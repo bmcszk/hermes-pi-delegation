@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import signal
+import subprocess
 import sys
 import time
 
@@ -374,7 +375,15 @@ def register(ctx):
             {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "kill", "doctor", "logs", "wait", "steer"],
+                    "enum": [
+                        "list",
+                        "kill",
+                        "doctor",
+                        "logs",
+                        "wait",
+                        "steer",
+                        "salvage_report",
+                    ],
                 },
                 "session_id": {"type": "string"},
                 "message": {
@@ -483,6 +492,8 @@ def _pi_manage_impl(
         return _doctor()
     if action == "logs":
         return _session_logs(session_id, lines)
+    if action == "salvage_report":
+        return _salvage_report(session_id, lines)
 
     if action == "list":
         agents = _read_registry()
@@ -572,6 +583,98 @@ def _wait_for_completion(session_id, budget, poll):
         if result["finished"] or deadline - time.monotonic() < poll:
             return result
         time.sleep(poll)
+
+
+def _git_readonly(cwd, *args):
+    """Run a read-only git command in cwd. Returns (ok, stdout)."""
+    try:
+        proc = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=30)
+        return proc.returncode == 0, (proc.stdout if proc.returncode == 0 else proc.stderr)
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _base_is_valid(cwd, base):
+    return bool(base) and bool(_git_readonly(cwd, "cat-file", "-e", f"{base}^{{commit}}")[0])
+
+
+def _gate_row(name, command):
+    """One salvage gate row: ok plus a short output tail or a named reason."""
+    try:
+        proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120)
+        tail = (proc.stdout + proc.stderr)[-2000:]
+        return {"name": name, "command": command, "ok": proc.returncode == 0, "output_tail": tail}
+    except Exception as exc:
+        return {
+            "name": name,
+            "command": command,
+            "ok": False,
+            "output_tail": "",
+            "skipped": str(exc),
+        }
+
+
+def _salvage_report(session_id, lines=12):
+    """Post-exit state collection for one session, in one call, shaped to
+    paste as the on-disk state section of a continuation contract. Read-only,
+    best-effort: every leg degrades to a named skip instead of raising.
+    """
+    entry = _newest_registry_entry(session_id)
+    if entry is None:
+        return {"finished": False, "status": "unknown"}
+    cwd = entry.get("cwd")
+    base = entry.get("base")
+    valid_base = _base_is_valid(cwd, base) if cwd else False
+
+    git_report = {}
+    if cwd and os.path.isdir(os.path.join(cwd, ".git")) and _git_readonly(cwd, "status")[0]:
+        ok_status, status_out = _git_readonly(cwd, "status", "--porcelain")
+        git_report["status"] = status_out if ok_status else ""
+        ok_head, head_out = _git_readonly(cwd, "log", "--oneline", "-1")
+        ok_sha, sha_out = _git_readonly(cwd, "rev-parse", "HEAD")
+        git_report["branch_head"] = "\n".join(x.strip() for x in (head_out, sha_out) if x)
+        if valid_base:
+            ok_log, log_out = _git_readonly(cwd, "log", "--oneline", f"{base}..HEAD")
+            git_report["commits_since_base"] = (
+                log_out.splitlines() if ok_log else {"skipped": log_out}
+            )
+            ok_diff, diff_out = _git_readonly(cwd, "diff", f"{base}..HEAD", "--stat")
+            git_report["diff_stat"] = (
+                diff_out.splitlines()[-6:] if ok_diff else {"skipped": diff_out}
+            )
+        else:
+            reason = (
+                "no base recorded for this row"
+                if not base
+                else "unknown revision: base not a commit of this repo"
+            )
+            git_report["commits_since_base"] = {"skipped": reason}
+            git_report["diff_stat"] = {"skipped": f"{reason}; uncommitted facts visible via status"}
+    else:
+        reason = "no recorded cwd for this row" if not cwd else f"cwd is not a git repo: {cwd}"
+        git_report["status"] = ""
+        git_report["branch_head"] = ""
+        git_report["commits_since_base"] = {"skipped": reason}
+        git_report["diff_stat"] = {"skipped": reason}
+
+    frames = _session_logs(session_id, lines)
+
+    return {
+        "session": session_id,
+        "cwd": cwd,
+        "base": base,
+        "collected_at": _now_iso(),
+        "git": git_report,
+        "frames": {
+            k: frames[k]
+            for k in ("error", "path", "mtime", "tool_calls", "last_text", "tail")
+            if k in frames
+        },
+        "gates": [
+            _gate_row("uvx-ruff-check", "uvx ruff check ."),
+            _gate_row("compileall-plugin", "python -m compileall -q __init__.py scripts tests"),
+        ],
+    }
 
 
 def _doctor():

@@ -130,6 +130,25 @@ def _registry_patch(session_id, pid, **fields):
         pass
 
 
+def _launch_base_git(cwd):
+    """HEAD sha of the dispatch cwd at launch, best-effort (None when git is
+    unavailable or cwd is not a repo)."""
+    if not cwd:
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.strip() or None
+    except Exception:
+        pass
+    return None
+
+
 def _discovered_log_path(agent_dir, session_id):
     """Best next transcript candidate from pi's sessions tree, or None.
 
@@ -820,6 +839,12 @@ def main(argv: list[str] | None = None) -> int:
             os.remove(stale_steer)
     client.start()
     _registry_write(args.session_id or "unnamed", args.model, "running")
+    _launch_facts = {"cwd": args.cwd, "base": _launch_base_git(args.cwd)}
+    _registry_patch(
+        args.session_id or "unnamed",
+        os.getpid(),
+        **{k: v for k, v in _launch_facts.items() if v},
+    )
     status = "done"
     exit_code = 0
     try:

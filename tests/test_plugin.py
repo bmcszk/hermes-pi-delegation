@@ -2168,3 +2168,179 @@ def test_client_records_transcript_path_in_registry():
             child.wait(timeout=10)
         _teardown_registry()
         shutil.rmtree(tmpdir)
+
+
+GIT_IDENTITY_ENV = {
+    "GIT_AUTHOR_NAME": "salvage",
+    "GIT_AUTHOR_EMAIL": "salvage@test",
+    "GIT_COMMITTER_NAME": "salvage",
+    "GIT_COMMITTER_EMAIL": "salvage@test",
+}
+
+
+def _make_repo(pwd):
+    """Init a tmp git repo: one base commit, then one later 'work' commit."""
+    env = {**os.environ, **GIT_IDENTITY_ENV}
+    subprocess.run(["git", "init", "-q", "-b", "main", pwd], check=True, env=env)
+    subprocess.run(["git", "config", "user.email", "s@t"], cwd=pwd, check=True, env=env)
+    subprocess.run(["git", "config", "user.name", "s"], cwd=pwd, check=True, env=env)
+    with open(os.path.join(pwd, "a.txt"), "w") as f:
+        f.write("base\n")
+    subprocess.run(["git", "add", "a.txt"], cwd=pwd, check=True, env=env)
+    subprocess.run(["git", "commit", "-qm", "base commit"], cwd=pwd, check=True, env=env)
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=pwd, check=True, capture_output=True, text=True, env=env
+    ).stdout.strip()
+    with open(os.path.join(pwd, "a.txt"), "w") as f:
+        f.write("changed\n")
+    subprocess.run(["git", "add", "a.txt"], cwd=pwd, check=True, env=env)
+    subprocess.run(["git", "commit", "-qm", "work commit"], cwd=pwd, check=True, env=env)
+    with open(os.path.join(pwd, "a.txt"), "w") as f:
+        f.write("uncommitted\n")
+    return base
+
+
+def test_salvage_report_collects_one_call(tmp_path):
+    """One kill-shaped row (cwd/base/log_path stamped): the whole salvage
+    order in a single answer, shaped for a continuation contract."""
+    repo = str(tmp_path / "repo")
+    base = _make_repo(repo)
+    transcript = tmp_path / "pi" / "sessions" / "anywhere" / "t_epicSal-coder.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "message",
+                "message": {"role": "assistant", "content": [{"type": "toolCall", "name": "bash"}]},
+            }
+        )
+        + "\n"
+    )
+    _setup_registry(str(tmp_path))
+    try:
+        _write_registry(
+            {
+                "session": "epicSal-coder",
+                "pid": 999999,
+                "status": "killed",
+                "exit_code": 143,
+                "cwd": repo,
+                "base": base,
+                "log_path": str(transcript),
+                "started": "2024-01-01T00:00:00",
+            }
+        )
+        result = _parse(p._pi_manage_impl("salvage_report", session_id="epicSal-coder", lines=5))
+        assert "error" not in result, result
+        assert result["session"] == "epicSal-coder"
+        assert result["cwd"] == repo
+        assert result["base"] == base
+        assert "collected_at" in result
+        assert result["git"]["status"].strip(), result["git"]
+        assert result["git"]["commits_since_base"][0].endswith("work commit"), result["git"]
+        assert any("a.txt" in line for line in result["git"]["diff_stat"]), result["git"]
+        assert result["git"]["branch_head"], result["git"]
+        assert result["frames"]["path"] == str(transcript), result
+        assert result["frames"]["tool_calls"] == 1, result["frames"]
+        gates = {row["name"]: row for row in result["gates"]}
+        assert set(gates) == {"uvx-ruff-check", "compileall-plugin"}, gates
+        for row in result["gates"]:
+            assert row["ok"] in (True, False), row
+            assert row["command"], row
+    finally:
+        _teardown_registry()
+
+
+def test_salvage_report_git_facts_from_recorded_cwd(tmp_path):
+    """The git facts describe the row's recorded cwd, not the process cwd."""
+    repo = str(tmp_path / "repo")
+    base = _make_repo(repo)
+    other = str(tmp_path / "elsewhere-empty")
+    os.makedirs(other)
+    _setup_registry(str(tmp_path))
+    old_cwd = os.getcwd()
+    os.chdir(other)
+    try:
+        _write_registry(
+            {
+                "session": "epicCwd-coder",
+                "pid": 999999,
+                "status": "killed",
+                "cwd": repo,
+                "base": base,
+                "started": "2024-01-01T00:00:00",
+            }
+        )
+        result = _parse(p._pi_manage_impl("salvage_report", session_id="epicCwd-coder"))
+        assert "error" not in result, result
+        # an unrelated empty cwd would make "git log" fail; the recorded cwd works
+        assert result["git"]["commits_since_base"][0].endswith("work commit"), result["git"]
+        assert result["cwd"] == repo
+    finally:
+        os.chdir(old_cwd)
+        _teardown_registry()
+
+
+def test_salvage_report_missing_base_reports_named_skips(tmp_path):
+    """No base row field: commits_since_base/diff_stat carry skip reasons,
+    the rest of the report still lands."""
+    repo = str(tmp_path / "repo")
+    _make_repo(repo)
+    _setup_registry(str(tmp_path))
+    try:
+        _write_registry(
+            {
+                "session": "epicNoBase-coder",
+                "pid": 999999,
+                "status": "killed",
+                "cwd": repo,
+                "started": "2024-01-01T00:00:00",
+            }
+        )
+        result = _parse(p._pi_manage_impl("salvage_report", session_id="epicNoBase-coder"))
+        assert "error" not in result, result
+        assert result["base"] is None, result["base"]
+        assert "skipped" in result["git"]["commits_since_base"], result["git"]
+        assert "no base recorded" in result["git"]["commits_since_base"]["skipped"].lower(), result[
+            "git"
+        ]
+        assert "skipped" in result["git"]["diff_stat"], result["git"]
+        assert result["git"]["status"], result["git"]
+    finally:
+        _teardown_registry()
+
+
+def test_salvage_report_invalid_base_reports_named_skips(tmp_path):
+    """A base the repo does not know: named skip, not an exception."""
+    repo = str(tmp_path / "repo")
+    _make_repo(repo)
+    _setup_registry(str(tmp_path))
+    try:
+        _write_registry(
+            {
+                "session": "epicBadBase-coder",
+                "pid": 999999,
+                "status": "killed",
+                "cwd": repo,
+                "base": "0" * 40,
+                "started": "2024-01-01T00:00:00",
+            }
+        )
+        result = _parse(p._pi_manage_impl("salvage_report", session_id="epicBadBase-coder"))
+        assert "error" not in result, result
+        assert "skipped" in result["git"]["commits_since_base"], result["git"]
+        assert "unknown revision" in result["git"]["commits_since_base"]["skipped"].lower(), result[
+            "git"
+        ]
+    finally:
+        _teardown_registry()
+
+
+def test_salvage_report_unknown_session_error_unchanged(tmp_path):
+    """No registry rows for the session: the existing unknown shape."""
+    _setup_registry(str(tmp_path))
+    try:
+        result = _parse(p._pi_manage_impl("salvage_report", session_id="epicGhost-coder"))
+        assert result["finished"] is False and result["status"] == "unknown", result
+    finally:
+        _teardown_registry()
