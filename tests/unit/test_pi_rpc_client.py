@@ -1,5 +1,6 @@
 """Tests for pi_rpc_client. No network, no model calls, no real pi process."""
 
+import contextlib
 import json
 import os
 import shutil
@@ -803,3 +804,50 @@ exec sleep 60
         entry = _terminal_registry_line(tmp_path / "pi-agents.jsonl", self.SESSION)
         assert entry["status"] == "incomplete"
         assert entry["exit_code"] == 3
+
+
+class TestHeartbeatBudget:
+    """A failed stamp never consumes the 5 s budget; the dir gets ensured."""
+
+    def test_failed_write_does_not_consume_the_beat_budget(self, tmp_path, monkeypatch):
+        # given the write path is broken: the heartbeat dir sits under a FILE,
+        # so the ensure fails and the tick lands nowhere
+        import pi_rpc_client as mod
+
+        logs_dir = tmp_path / "blocked"
+        logs_dir.write_text("this is a file, not a dir")
+        monkeypatch.setattr(mod, "REGISTRY_PATH", str(logs_dir / "pi-agents.jsonl"))
+        client, _ = make_client(scripted_lines("x"))
+        client.session_id = "sess-budget"
+        hb_path = logs_dir / "pi-heartbeat-sess-budget.json"
+        client._heartbeat_tick(force=True)
+        assert not hb_path.exists()
+        # the failed write moved nothing: the budget stays at its initial value
+        assert client._last_beat == 0.0, "failed write consumed the budget"
+
+        # when the blocker is removed and the NEXT FRAME arrives immediately
+        # (a real clock tick: real_now - the untouched budget >> 5 s)
+        logs_dir.unlink()
+        logs_dir.mkdir(parents=True)
+        client._heartbeat_tick()
+
+        # then the stamp lands
+        assert hb_path.exists(), "second tick was silently dropped"
+
+    def test_first_tick_creates_dir_and_stamps(self, tmp_path, monkeypatch):
+        import pi_rpc_client as mod
+
+        logs_dir = tmp_path / "logs"
+        monkeypatch.setattr(mod, "REGISTRY_PATH", str(logs_dir / "pi-agents.jsonl"))
+        client, _ = make_client(scripted_lines("x"))
+        client.session_id = "sess-budget"
+        hb_path = logs_dir / "pi-heartbeat-sess-budget.json"
+        # given any construction-time leftovers are out of the way
+        with contextlib.suppress(OSError):
+            os.remove(hb_path)
+
+        client._heartbeat_tick(force=True)
+
+        assert hb_path.exists(), "fresh dispatch stamp never landed"
+        data = json.loads(hb_path.read_text())
+        assert data["frames"] == client._frames_seen

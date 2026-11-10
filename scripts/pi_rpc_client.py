@@ -535,19 +535,26 @@ class PiRpcClient:
             time.sleep(0.05)
 
     def _heartbeat_tick(self, force: bool = False) -> None:
-        """Stamp liveness for pi_manage list; one write per 5 s at most."""
+        """Stamp liveness for pi_manage list; one write per 5 s at most.
+
+        The stamp must survive the race where the first tick fires before
+        main() creates ~/.hermes/logs: the beat time advances only AFTER a
+        successful write, and the dir is ensured best-effort, so a failed
+        early tick is retried on the next frame instead of gone for 5 s.
+        """
         path = _heartbeat_file(self.session_id)
         if not path:
             return
         now = time.time()
         if not force and now - self._last_beat < 5.0:
             return
-        self._last_beat = now
         try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w") as f:
                 json.dump(
                     {"ts": now, "frames": self._frames_seen, "tools": len(self.tool_calls)}, f
                 )
+            self._last_beat = now
         except OSError:
             pass
 
