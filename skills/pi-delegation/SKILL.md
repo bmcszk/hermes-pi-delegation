@@ -24,7 +24,10 @@ repo README; this skill is only the control loop.
    then exits 3). `epic_id` and `task_slug` name the session; run one
    worker per project at a time.
 3. `pi_manage(action="wait", session_id=<id>)` blocks until the registry
-   line is terminal and the pid is gone. Never sleep and poll.
+   line is terminal and the pid is gone. Never sleep and poll. `wait` can
+   answer `finished: false` with `status: unknown` while the worker is
+   alive; treat that as no signal and re-check via `list`
+   `last_activity_s` or by waiting on the client process itself.
 4. Verify the work on disk yourself: diff, gates, test counts. A completion
    report is a claim, not a result.
 
@@ -66,6 +69,9 @@ the tree, not the words.
 
 - One deliverable per dispatch; long work gets chained slices.
 - `require_edit` takes one exact file path, never a directory.
+- Aim `require_edit` at a file the contract itself orders the worker to
+  create or modify; aiming it at files whose edits predate the dispatch
+  burns the whole nudge budget on a satisfied tree and exits 3.
 - Commit one unit at a time so partial progress survives a timeout.
 - Keep each write payload small. One giant write dies mid-JSON and repeats
   until the correction budget is gone.
