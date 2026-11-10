@@ -32,6 +32,14 @@ Generates one worker dispatch.
 | `timeout_s` | no | Idle budget per dispatch. Defaults to `PI_WORKER_TIMEOUT_S`, 900 s. |
 | `wall_timeout_s` | no | Hard ceiling on the whole dispatch. Defaults to `max(3600, timeout_s + 900)`. |
 
+Preflight validates the dispatch before anything spawns: the `model` alias is
+checked against the deployment's own model list (`models.json` plus
+`defaultModel`, both read from the worker agent dir — an unknown alias is a
+launch error, an unreadable list degrades to a warning, never an assumed
+error), omitting `model` draws a warning that the worker runs pi's
+`defaultModel`, and `epic_id` + `task_slug` set together are rejected (mutually
+exclusive; `epic_id` wins the session id).
+
 Worker types carry tool policy; what each is FOR and what its deliverable is:
 
 | Worker type | Purpose | Deliverable | Tools | codemode | thinking |

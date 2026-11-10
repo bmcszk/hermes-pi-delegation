@@ -187,11 +187,12 @@ def test_pi_launch_resolves_bare_name_project_root(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     # when launching with the bare name
     result = _launch_with_skill("probe-widget-skill", str(proj))
-    # then the command carries the resolved project path and no discovery warning
+    # then the command carries the resolved project path and no discovery warning;
+    # model rows on an unverifiable alias are preflight's own concern (model tests)
     assert "error" not in result, result
     parts = shlex.split(result["command"])
     assert os.path.join(str(proj), ".agents/skills", "probe-widget-skill") in parts
-    assert result.get("warnings", []) == []
+    assert not any("outside pi skill discovery" in w for w in result.get("warnings", [])), result
 
 
 def test_pi_launch_resolves_bare_name_project_ancestor(tmp_path, monkeypatch):
@@ -393,7 +394,7 @@ def test_generated_command_single_line_and_parseable():
         # the emitted line starts with the preflight + budget notes, then the client
         assert parts[0] == "echo", wt
         assert parts[1].endswith(
-            "preflight ok: contract, require_edit anchors, skills, budgets, cwd"
+            "preflight ok: contract, anchors, skills, budgets, cwd, model, naming"
         ), wt
         assert parts[2] == "&&", wt
         assert parts[3] == "echo", wt
