@@ -3009,3 +3009,86 @@ def test_launch_auto_no_contract_spawns_nothing(tmp_path, monkeypatch):
     result = _parse(pi_launch({**kwargs, "auto": True}))
     assert result.get("error", "").startswith("preflight"), result
     assert "dispatched" not in result, result
+
+
+def _salvage_row_setup(tmp_path, cwd, **extra):
+    """Informal helper: registry row wired for salvage cwd tests."""
+    _setup_registry(str(tmp_path))
+    _write_registry(
+        {
+            "session": "epicRev-coder",
+            "pid": 999999,
+            "status": "killed",
+            "cwd": cwd,
+            "started": "2024-01-01T00:00:00",
+            **extra,
+        }
+    )
+
+
+def test_salvage_gates_run_in_recorded_cwd(tmp_path, monkeypatch):
+    """A tmp repo whose gate command fails, while the process cwd passes:
+    the row must report the tmp repo's failure, not the caller's."""
+    import pathlib
+
+    repo = str(tmp_path / "proj")
+    pathlib.Path(repo).mkdir()
+    with open(os.path.join(repo, "AGENTS.md"), "w") as f:
+        f.write("m\n")
+    # the tmp repo FAILS the compileall gate deterministically: broken syntax
+    with open(os.path.join(repo, "__init__.py"), "w") as f:
+        f.write("def broken(:\n")
+    _salvage_row_setup(tmp_path, repo)
+    old_cwd = os.getcwd()
+    os.chdir(str(tmp_path))  # process cwd is OUTSIDE the row's cwd
+    try:
+        result = _parse(p._pi_manage_impl("salvage_report", session_id="epicRev-coder"))
+        assert "error" not in result, result
+        compile_row = next(r for r in result["gates"] if r["name"] == "compileall-plugin")
+        assert compile_row["ok"] is False, compile_row
+        assert "broken" in compile_row["output_tail"], compile_row
+    finally:
+        os.chdir(old_cwd)
+        _teardown_registry()
+
+
+def test_salvage_git_legs_work_in_worktree(tmp_path):
+    """git worktree checkout as the row cwd: git legs populated, not skipped."""
+    repo = str(tmp_path / "seed")
+    env = {**os.environ, **GIT_IDENTITY_ENV}
+    subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True, env=env)
+    subprocess.run(["git", "-C", repo, "config", "user.email", "s@t"], check=True, env=env)
+    subprocess.run(["git", "-C", repo, "config", "user.name", "s"], check=True, env=env)
+    with open(os.path.join(repo, "a.md"), "w") as f:
+        f.write("seed\n")
+    subprocess.run(["git", "-C", repo, "add", "a.md"], check=True, env=env)
+    subprocess.run(["git", "-C", repo, "commit", "-qm", "base commit"], check=True, env=env)
+    base = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    ).stdout.strip()
+    wt = str(tmp_path / "lane-wt")
+    subprocess.run(["git", "-C", repo, "worktree", "add", "-q", wt], check=True, env=env)
+    with open(os.path.join(wt, "a.md"), "w") as f:
+        f.write("worktree edit\n")
+    subprocess.run(["git", "-C", wt, "add", "a.md"], check=True, env=env)
+    subprocess.run(["git", "-C", wt, "commit", "-qm", "work commit"], check=True, env=env)
+    with open(os.path.join(wt, "a.md"), "w") as f:
+        f.write("worktree edit uncommitted\n")
+
+    _salvage_row_setup(tmp_path, wt, base=base)
+    try:
+        result = _parse(p._pi_manage_impl("salvage_report", session_id="epicRev-coder"))
+        assert "error" not in result, result
+        assert result["git"]["status"].strip(), result["git"]
+        csb = result["git"]["commits_since_base"]
+        assert not (isinstance(csb, dict) and "skipped" in csb), csb
+        assert csb[0].endswith("work commit"), csb
+    finally:
+        subprocess.run(
+            ["git", "-C", repo, "worktree", "remove", "--force", wt], check=True, env=env
+        )
+        _teardown_registry()

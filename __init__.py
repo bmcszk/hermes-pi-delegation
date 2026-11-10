@@ -650,10 +650,16 @@ def _base_is_valid(cwd, base):
     return bool(base) and bool(_git_readonly(cwd, "cat-file", "-e", f"{base}^{{commit}}")[0])
 
 
-def _gate_row(name, command):
-    """One salvage gate row: ok plus a short output tail or a named reason."""
+def _gate_row(name, command, cwd):
+    """One salvage gate row: ok plus a short output tail or a named reason.
+
+    cwd comes from the registry row: the gate must judge THE SESSION'S tree,
+    not the caller's. A failing invocation (command absent, unwritable cwd,
+    120 s timeout cap) degrades to a skipped row."""
     try:
-        proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120)
+        proc = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=120, cwd=cwd
+        )
         tail = (proc.stdout + proc.stderr)[-2000:]
         return {"name": name, "command": command, "ok": proc.returncode == 0, "output_tail": tail}
     except Exception as exc:
@@ -679,7 +685,7 @@ def _salvage_report(session_id, lines=12):
     valid_base = _base_is_valid(cwd, base) if cwd else False
 
     git_report = {}
-    if cwd and os.path.isdir(os.path.join(cwd, ".git")) and _git_readonly(cwd, "status")[0]:
+    if cwd and _git_readonly(cwd, "status")[0]:
         ok_status, status_out = _git_readonly(cwd, "status", "--porcelain")
         git_report["status"] = status_out if ok_status else ""
         ok_head, head_out = _git_readonly(cwd, "log", "--oneline", "-1")
@@ -735,8 +741,10 @@ def _salvage_report(session_id, lines=12):
         },
         "lane_lock": lane_lock_row,
         "gates": [
-            _gate_row("uvx-ruff-check", "uvx ruff check ."),
-            _gate_row("compileall-plugin", "python -m compileall -q __init__.py scripts tests"),
+            _gate_row("uvx-ruff-check", "uvx ruff check .", cwd),
+            _gate_row(
+                "compileall-plugin", "python -m compileall -q __init__.py scripts tests", cwd
+            ),
         ],
     }
 

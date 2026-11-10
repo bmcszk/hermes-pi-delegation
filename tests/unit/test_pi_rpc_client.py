@@ -643,14 +643,6 @@ class TestMainExitCode:
 
     SESSION = "sess-exit"
 
-    def _fake_pi_on_path(self, tmp_path: Path) -> str:
-        bin_dir = tmp_path / "bin"
-        bin_dir.mkdir()
-        fake_pi = bin_dir / "pi"
-        fake_pi.write_text(FAKE_PI_SH)
-        fake_pi.chmod(0o755)
-        return str(bin_dir)
-
     def _child(self, tmp_path: Path, fake_pi_sh: str | None = None) -> tuple[list[str], dict, Path]:
         # Run as a real script: only then does the __main__ block install the
         # SIGTERM handler the production path uses. HOME pins the registry

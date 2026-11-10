@@ -457,8 +457,6 @@ class PiRpcClient:
 
     def _log_frame(self, frame: dict) -> None:
         """Append every frame to PI_RPC_FRAMELOG (jsonl) when set: diagnosis aid."""
-        import os
-
         path = os.environ.get("PI_RPC_FRAMELOG")
         if not path:
             return
