@@ -45,6 +45,10 @@ REGISTRY_PATH = os.path.join(os.path.expanduser("~"), ".hermes", "logs", "pi-age
 # hard ceiling on one dispatch regardless of frame traffic.
 WALL_TIMEOUT_S = float(os.environ.get("PI_WORKER_WALL_TIMEOUT_S", "3600"))
 
+# Transcript discovery floor: sessions created before the client started are
+# other workers' transcripts; wall-clock launch time bounds the scan window.
+_LAUNCH_MONOTONIC_SKEW_FLOOR = time.time()
+
 
 # Both live under the registry dir so test setups that monkeypatch
 # REGISTRY_PATH relocate them for free.
@@ -92,6 +96,81 @@ def _killed_exit_code(exc):
     return code if isinstance(code, int) else None
 
 
+def _registry_patch(session_id, pid, **fields):
+    """Merge fields into this session+pid's RUNNING line. Best-effort, never
+    raises. True when a line changed, so the caller can retry a stamp that
+    raced its row into existence."""
+    try:
+        lines = []
+        changed = False
+        if os.path.exists(REGISTRY_PATH):
+            with open(REGISTRY_PATH) as f:
+                for line in f:
+                    try:
+                        data = json.loads(line)
+                    except Exception:
+                        lines.append(line)
+                        continue
+                    if (
+                        data.get("session") == session_id
+                        and data.get("pid") == pid
+                        and data.get("status") == "running"
+                    ):
+                        merged = dict(data)
+                        merged.update(fields)
+                        if merged != data:
+                            lines.append(json.dumps(merged) + "\n")
+                            changed = True
+                            continue
+                    lines.append(line)
+        if changed:
+            with open(REGISTRY_PATH, "w") as f:
+                f.writelines(lines)
+    except Exception:
+        pass
+
+
+def _discovered_log_path(agent_dir, session_id):
+    """Best next transcript candidate from pi's sessions tree, or None.
+
+    pi never announces the transcript path over RPC (verified against the real
+    binary: no startup frame, no stderr line) and its filenames need not
+    contain the session id, so the client collects .jsonl files created since
+    launch, with this preference order:
+    1. filename contains the session id;
+    2. leading bytes (~16KB) contain the session id string (real pi writes
+       {"type":"session","id":...} as the first line, verified);
+    3. mtime-newest — the only tiebreak for transcripts that match neither;
+       two concurrent id-less content-less candidates remain ambiguous.
+    """
+    base = agent_dir or os.path.join(os.path.expanduser("~"), ".pi", "agent")
+    candidates = [
+        p
+        for p in glob.glob(os.path.join(base, "sessions", "*", "*.jsonl"))
+        if os.stat(p).st_mtime >= _LAUNCH_MONOTONIC_SKEW_FLOOR
+    ]
+    if not candidates:
+        return None
+    matching = [p for p in candidates if session_id and session_id in os.path.basename(p)]
+    if matching:
+        return max(matching, key=os.path.getmtime)
+    if session_id:
+        content_matches = [p for p in candidates if _content_contains(p, session_id)]
+        if content_matches:
+            return max(content_matches, key=os.path.getmtime)
+    return max(candidates, key=os.path.getmtime)
+
+
+def _content_contains(path, needle):
+    """True when needle appears in the file's first ~16KB. Best-effort; any
+    unreadable candidate simply cannot match."""
+    try:
+        with open(path, "rb") as f:
+            return needle.encode("utf-8") in f.read(16384)
+    except OSError:
+        return False
+
+
 def _registry_write(session_id, model, status, pid=None, exit_code=None):
     """Append/update the agent registry line. Never raises, never blocks dispatch."""
     try:
@@ -123,8 +202,10 @@ def _registry_update_running(session_id, entry):
     """Replace the running line matching session+pid.
 
     If the session+pid already has any terminal line (killed/dead/done), the
-    external terminal state wins and we do nothing; append only when the
-    session+pid has no line at all (crash-before-write case).
+    external terminal state wins and we do nothing; the running row being
+    replaced is merged with the terminal entry (additive keys like log_path
+    survive the swap); append only when the session+pid has no line at all
+    (crash-before-write case).
     """
     try:
         lines = []
@@ -141,7 +222,9 @@ def _registry_update_running(session_id, entry):
                     if data.get("session") == session_id and data.get("pid") == entry["pid"]:
                         exists = True
                         if not replaced and data.get("status") == "running":
-                            lines.append(json.dumps(entry) + "\n")
+                            merged = dict(data)
+                            merged.update(entry)
+                            lines.append(json.dumps(merged) + "\n")
                             replaced = True
                             continue
                     lines.append(line)
@@ -217,6 +300,8 @@ class PiRpcClient:
         self._frames_seen = 0
         self._last_beat = 0.0
         self._send_lock = threading.Lock()
+        self.log_path: str | None = None
+        self._log_path_stamped = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -285,6 +370,7 @@ class PiRpcClient:
                 self._frames.put(frame)
                 self._frames_seen += 1
                 self._drain_steer()
+                self._record_log_path()
                 self._heartbeat_tick()
 
     # -- protocol ----------------------------------------------------------
@@ -333,6 +419,40 @@ class PiRpcClient:
             self.steered.append(text)
         except Exception:
             pass
+
+    def _record_log_path(self) -> None:
+        """Locate pi's real transcript once and stamp it into the running row.
+
+        Discovery runs until the first hit; the stamp retries while the running
+        row has no log_path yet, because the first frame can arrive before
+        main() has written that row. Every step is best-effort so discovery can
+        never break the dispatch. --no-session runs find nothing.
+        """
+        if self.no_session or not self.session_id:
+            return
+        if self.log_path is None:
+            found = _discovered_log_path(self.agent_dir, self.session_id)
+            if not found:
+                return
+            self.log_path = found
+        if self._log_path_stamped:
+            return
+        if _registry_patch(self.session_id, os.getpid(), log_path=self.log_path):
+            self._log_path_stamped = True
+
+    def stamp_log_path_into_registry(self) -> None:
+        """Bounded retry of the running-row stamp after main() wrote that row.
+
+        The ready frame usually beats the running write, so the first
+        _record_log_path call finds no row to patch; this gives it one short
+        window to land instead of waiting for frames the worker may never send.
+        """
+        deadline = time.monotonic() + 2.0
+        while not self._log_path_stamped and time.monotonic() < deadline:
+            self._record_log_path()
+            if self._log_path_stamped:
+                return
+            time.sleep(0.05)
 
     def _heartbeat_tick(self, force: bool = False) -> None:
         """Stamp liveness for pi_manage list; one write per 5 s at most."""
@@ -703,6 +823,9 @@ def main(argv: list[str] | None = None) -> int:
     status = "done"
     exit_code = 0
     try:
+        # Inside the guarded region: a SIGTERM during the bounded stamp loop
+        # must still reach the finally below, or the killed line never lands.
+        client.stamp_log_path_into_registry()
         text = client.run(
             args.prompt,
             timeout_s=args.timeout_s or DEFAULT_TIMEOUT_S,

@@ -607,17 +607,32 @@ def _doctor():
     return report
 
 
+def _transcript_for(session_id):
+    """Resolve a session's transcript path, or None.
+
+    Registry log_path first (the client learned pi's real transcript even when
+    its filename lacks the session slug), then the legacy slug glob for rows
+    recorded before that fix.
+    """
+    import glob
+
+    entry = _newest_registry_entry(session_id)
+    if entry is not None:
+        registered = entry.get("log_path")
+        if registered and os.path.isfile(registered):
+            return registered
+    pattern = os.path.expanduser(f"~/.pi/agent/sessions/*/*{session_id}*.jsonl")
+    matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+    return matches[0] if matches else None
+
+
 def _session_logs(session_id, lines=40):
     """Tail the newest pi session log for a session id."""
     if not session_id:
         return {"error": "logs requires session_id"}
-    import glob
-
-    pattern = os.path.expanduser(f"~/.pi/agent/sessions/*/*{session_id}*.jsonl")
-    matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
-    if not matches:
+    path = _transcript_for(session_id)
+    if not path:
         return {"error": f"no session log for {session_id}"}
-    path = matches[0]
     tail, tool_calls, last_text = [], 0, ""
     try:
         with open(path) as handle:

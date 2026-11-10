@@ -449,6 +449,53 @@ class TestRegistryUpdate:
         assert mod._killed_exit_code(RuntimeError("x")) is None
         assert mod._killed_exit_code(SystemExit("128+15")) is None
 
+    def test_registry_update_running_carries_log_path(self, tmp_path, monkeypatch):
+        mod = self._write_registry(tmp_path, monkeypatch, [])
+        mod._registry_write("S6", "m", "running", pid=666)
+        mod._registry_patch("S6", 666, log_path="/pi/sessions/d/x.jsonl")
+        mod._registry_write("S6", "m", "done", pid=666, exit_code=0)
+        with open(mod.REGISTRY_PATH) as f:
+            rows = [json.loads(line) for line in f]
+        terminal = [r for r in rows if r["pid"] == 666]
+        assert len(terminal) == 1
+        assert terminal[0]["status"] == "done"
+        assert terminal[0]["exit_code"] == 0
+        assert terminal[0]["log_path"] == "/pi/sessions/d/x.jsonl"
+
+    def test_registry_update_running_killed_row_keeps_log_path(self, tmp_path, monkeypatch):
+        mod = self._write_registry(tmp_path, monkeypatch, [])
+        mod._registry_write("S7", "m", "running", pid=777)
+        mod._registry_patch("S7", 777, log_path="/pi/sessions/d/y.jsonl")
+        mod._registry_write("S7", "m", "killed", pid=777, exit_code=143)
+        with open(mod.REGISTRY_PATH) as f:
+            rows = [json.loads(line) for line in f]
+        terminal = [r for r in rows if r["pid"] == 777]
+        assert len(terminal) == 1
+        assert terminal[0]["status"] == "killed"
+        assert terminal[0]["log_path"] == "/pi/sessions/d/y.jsonl"
+
+    def test_discovered_log_path_prefers_content_id_match(self, tmp_path, monkeypatch):
+        """Id-less filenames for two fresh transcripts: each client stamps the
+        candidate whose leading bytes carry its own session id."""
+        import pi_rpc_client as mod
+
+        sessions = tmp_path / "sessions"
+        (sessions / "d1").mkdir(parents=True)
+        other = sessions / "d1" / "2026-01-01T_uuid-other.jsonl"
+        mine = sessions / "d1" / "2026-01-01T_uuid-mine.jsonl"
+        other.write_text(
+            '{"type":"session","version":3,"id":"someone-else","timestamp":"t"}\n' + "x" * 20000
+        )
+        mine.write_text(
+            '{"type":"session","version":3,"id":"my-worker","timestamp":"t"}\n' + "x" * 20000
+        )
+        # keep both firmly newer than any launch floor
+        mtime = time.time() + 60
+        os.utime(other, (mtime, mtime))
+        os.utime(mine, (mtime + 1, mtime + 1))
+        monkeypatch.setattr("pi_rpc_client._LAUNCH_MONOTONIC_SKEW_FLOOR", time.time() - 120)
+        assert mod._discovered_log_path(tmp_path, "my-worker") == str(mine)
+
 
 class TestPiBinaryDiscovery:
     """Binary discovery is machine-agnostic: PATH first, then per-user roots."""
@@ -603,14 +650,19 @@ class TestMainExitCode:
         fake_pi.chmod(0o755)
         return str(bin_dir)
 
-    def _child(self, tmp_path: Path) -> tuple[list[str], dict, Path]:
+    def _child(self, tmp_path: Path, fake_pi_sh: str | None = None) -> tuple[list[str], dict, Path]:
         # Run as a real script: only then does the __main__ block install the
         # SIGTERM handler the production path uses. HOME pins the registry
         # under tmp_path, so the subprocess never touches the machine's file.
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        fake_pi = bin_dir / "pi"
+        fake_pi.write_text(fake_pi_sh or FAKE_PI_SH)
+        fake_pi.chmod(0o755)
         env = {
             **os.environ,
             "HOME": str(tmp_path),
-            "PATH": f"{self._fake_pi_on_path(tmp_path)}:{os.environ.get('PATH', '')}",
+            "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
         }
         argv = [
             sys.executable,
@@ -646,6 +698,41 @@ class TestMainExitCode:
         entry = _terminal_registry_line(registry, self.SESSION)
         assert entry["status"] == "killed"
         assert entry["exit_code"] == 143
+
+    def test_sigterm_killed_row_keeps_discovered_log_path(self, tmp_path):
+        # given a client child whose fake pi leaves a transcript with an id-less
+        # filename under the agent-dir sessions tree
+        fake_pi_sh = """#!/bin/sh
+mkdir -p "$HOME/.pi/agent/sessions/spawn-dir"
+printf '%s\n' '{"type":"session","version":3,"id":"sess-exit","timestamp":"t"}' \
+  > "$HOME/.pi/agent/sessions/spawn-dir/2026-01-01T_blank-id.jsonl"
+echo '{"type":"ready"}'
+exec sleep 60
+"""
+        argv, env, registry = self._child(tmp_path, fake_pi_sh=fake_pi_sh)
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if registry.exists():
+                with open(registry) as f:
+                    if any("log_path" in line for line in f):
+                        break
+            time.sleep(0.05)
+        assert registry.exists(), "child never stamped log_path"
+
+        # when the parent SIGTERMs the child mid-run
+        proc.terminate()
+        rc = proc.wait(timeout=10)
+
+        # then the final killed row still carries the discovered transcript
+        assert rc == 143, rc
+        entry = _terminal_registry_line(registry, self.SESSION)
+        assert entry["status"] == "killed"
+        assert entry["exit_code"] == 143
+        transcript = (
+            tmp_path / ".pi" / "agent" / "sessions" / "spawn-dir" / "2026-01-01T_blank-id.jsonl"
+        )
+        assert entry["log_path"] == str(transcript), entry
 
     def test_done_run_registry_carries_0(self, tmp_path, monkeypatch):
         # given main() driving the scripted fake pi whose run makes no tool calls
