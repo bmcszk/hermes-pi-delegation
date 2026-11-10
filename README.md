@@ -81,6 +81,26 @@ the killed client never gets to write.
 Other non-signal failures exit per Python conventions (traceback to stderr,
 non-zero).
 
+### Lane locks
+
+One live dispatch holds one lock per lane: the client writes
+`<cwd>/.hermes/lane/LOCK/<session_id>.lock` (JSON: `session_id`, `pid`,
+`model`, `started_at`) at dispatch start and removes it on every terminal
+exit — done, incomplete, timeout, and the SIGTERM unwind all release it. The
+dir sits inside the `.hermes/` ignore region.
+
+A crash that skips removal (SIGKILL, OOM, power loss) leaves a **stale**
+lock behind: same file, dead pid. `pi_manage list` surfaces `lane_lock`
+(`{present, stale}`) on any registry entry whose lock is on disk, and
+`salvage_report` adds the full row — path, payload, staleness, and the exact
+`rm` command to remove it (the action itself deletes nothing; removal
+deliberately stays a human decision).
+
+While a lane is LIVE, run parent gates only from a DIFFERENT worktree — or
+after worker exit. The lock makes that contention visible instead of
+silent: a concurrent gate run in the same worktree is exactly the
+build-cache collision this lock exists to catch.
+
 ### Worker isolation directory
 
 Every dispatch points pi at `~/.pi/agent-worker` (`WORKER_AGENT_DIR`). The plugin

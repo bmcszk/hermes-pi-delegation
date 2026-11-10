@@ -1679,7 +1679,7 @@ exec sleep 5
 """
 
 
-def _spawn_real_client(tmpdir, session_id):
+def _spawn_real_client(tmpdir, session_id, cwd=None):
     """Spawn the real scripts/pi_rpc_client.py against a fake sleeping pi."""
     bin_dir = os.path.join(tmpdir, "bin")
     os.makedirs(bin_dir, exist_ok=True)
@@ -1711,6 +1711,7 @@ def _spawn_real_client(tmpdir, session_id):
             "p",
             "--timeout",
             "60",
+            *(["--cwd", str(cwd)] if cwd else []),
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -2661,3 +2662,86 @@ def test_readme_exit_code_table_covers_3_and_143():
     assert "| 143 | SIGTERM (external kill; kill action stamps 143 itself) |" in readme
     assert "| 0 | done: dispatch satisfied |" in readme
     assert "| 130 | KeyboardInterrupt (Ctrl-C) |" in readme
+
+
+def _lane_lock_path(cwd, session_id):
+    return os.path.join(cwd, ".hermes", "lane", "LOCK", f"{session_id}.lock")
+
+
+def test_lane_lock_lifecycle_live_and_exit(tmp_path):
+    """Real client subprocess: lock present while running (list surfaces
+    present:true stale:false), lock gone when the client exits."""
+    proj = str(tmp_path / "proj")
+    os.makedirs(proj)
+    with open(os.path.join(proj, "AGENTS.md"), "w") as f:
+        f.write("marker\n")
+    session = "task-lockfix-default"
+    # ONE world: the child's HOME carries the registry (like prod), list reads
+    # that p.REGISTRY_PATH, and the LOCK lands per-cwd under proj/.hermes/lane.
+    child_home = str(tmp_path / "home")
+    _setup_registry(os.path.join(child_home, ".hermes", "logs"))
+    p.REGISTRY_PATH = os.path.join(child_home, ".hermes", "logs", "pi-agents.jsonl")
+    child = _spawn_real_client(child_home, session, cwd=proj)
+    lock_path = _lane_lock_path(proj, session)
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline and not os.path.exists(lock_path):
+            time.sleep(0.05)
+        assert os.path.exists(lock_path), "client never wrote its lane lock"
+        with open(lock_path) as f:
+            payload = json.load(f)
+        assert payload["session_id"] == session
+        assert payload["pid"] == child.pid
+
+        agents = _parse(p._pi_manage_impl("list"))["agents"]
+        mine = next(a for a in agents if a["session"] == session)
+        assert mine["lane_lock"] == {"present": True, "stale": False}, mine
+
+        child.terminate()
+        assert child.wait(timeout=10) == 143
+        assert not os.path.exists(lock_path), "lock file survived the client exit"
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            child.wait(timeout=10)
+        _teardown_registry()
+
+
+def test_lane_lock_stale_after_crash_surfaced_and_reported(tmp_path):
+    """kill -9 shaped crash: lock persists; list marks stale:true;
+    salvage_report names the file + the rm command and deletes nothing."""
+    proj = str(tmp_path / "proj")
+    os.makedirs(proj)
+    with open(os.path.join(proj, "AGENTS.md"), "w") as f:
+        f.write("marker\n")
+    session = "task-lockstale-default"
+    _setup_registry(str(tmp_path))
+    lock_dir = os.path.join(proj, ".hermes", "lane", "LOCK")
+    os.makedirs(lock_dir)
+    lock_path = os.path.join(lock_dir, f"{session}.lock")
+    dead_pid = 999999
+    with open(lock_path, "w") as f:
+        json.dump({"session_id": session, "pid": dead_pid, "model": "m", "started_at": "now"}, f)
+    _write_registry(
+        {
+            "session": session,
+            "pid": dead_pid,
+            "status": "running",
+            "cwd": proj,
+            "started": "2024-01-01T00:00:00",
+        }
+    )
+
+    agents = _parse(p._pi_manage_impl("list"))["agents"]
+    mine = next(a for a in agents if a["session"] == session)
+    assert mine["lane_lock"] == {"present": True, "stale": True}, mine
+
+    result = _parse(p._pi_manage_impl("salvage_report", session_id=session))
+    lock_row = result.get("lane_lock")
+    assert lock_row, result
+    assert lock_row["path"] == lock_path
+    assert lock_row["stale"] is True
+    assert f"rm {lock_path}" in lock_row["removal"], lock_row
+    # the action itself deletes nothing
+    assert os.path.exists(lock_path)
+    _teardown_registry()

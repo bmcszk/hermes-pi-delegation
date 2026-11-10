@@ -118,6 +118,28 @@ def _live_session(session_id):
     return None
 
 
+def _lane_lock_info(cwd, session_id):
+    """Lane lock state for one session's cwd: None when absent, else present
+    plus stale (pid dead = crash leftover) and the lock's payload."""
+    if not cwd:
+        return None
+    path = os.path.join(cwd, ".hermes", "lane", "LOCK", f"{session_id}.lock")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except (OSError, ValueError):
+        payload = {}
+    pid = payload.get("pid")
+    return {
+        "present": True,
+        "stale": bool(pid) and not _pid_alive(pid),
+        "path": path,
+        "payload": payload,
+    }
+
+
 def _newest_registry_entry(session_id):
     """Latest registry entry for session_id (by started, then finished), or None."""
     newest = None
@@ -515,6 +537,13 @@ def _pi_manage_impl(
             age = _heartbeat_age(entry.get("session"))
             if age is not None:
                 entry["last_activity_s"] = age
+        # every registered entry surfaces its lane lock when one sits on disk:
+        # a stale lock (pid dead, crash leftover) belongs on the DEAD row too,
+        # which is exactly where the crashed worker's row is still running.
+        for agent in agents:
+            lock = _lane_lock_info(agent.get("cwd"), agent.get("session"))
+            if lock is not None:
+                agent["lane_lock"] = {"present": True, "stale": lock["stale"]}
         agents.sort(key=lambda e: e.get("started", ""), reverse=True)
         return {"agents": agents}
 
@@ -667,6 +696,17 @@ def _salvage_report(session_id, lines=12):
 
     frames = _session_logs(session_id, lines)
 
+    lock = _lane_lock_info(cwd, session_id)
+    if lock is not None:
+        lane_lock_row = {
+            "path": lock["path"],
+            "stale": lock["stale"],
+            "payload": lock["payload"],
+            "removal": f"rm {lock['path']}" + ("  # stale: pid gone" if lock["stale"] else ""),
+        }
+    else:
+        lane_lock_row = {"present": False}
+
     return {
         "session": session_id,
         "cwd": cwd,
@@ -678,6 +718,7 @@ def _salvage_report(session_id, lines=12):
             for k in ("error", "path", "mtime", "tool_calls", "last_text", "tail")
             if k in frames
         },
+        "lane_lock": lane_lock_row,
         "gates": [
             _gate_row("uvx-ruff-check", "uvx ruff check ."),
             _gate_row("compileall-plugin", "python -m compileall -q __init__.py scripts tests"),

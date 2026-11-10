@@ -28,6 +28,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -178,6 +179,53 @@ def _discovered_log_path(agent_dir, session_id):
         if content_matches:
             return max(content_matches, key=os.path.getmtime)
     return max(candidates, key=os.path.getmtime)
+
+
+def _lane_lock_path(session_id):
+    """Hold-point for one dispatch: <cwd>/.hermes/lane/LOCK/<session>.lock.
+
+    The cwd is embedded WHERE the dispatch runs, so the helper cannot know it
+    alone — callers pass the launch cwd. The dir lives under .hermes/lane,
+    inside the .gitignore region.
+    """
+    if not session_id:
+        return None
+    return os.path.join(".hermes", "lane", "LOCK", f"{session_id}.lock")
+
+
+def _lane_lock_acquire(session_id, cwd, model, pid):
+    """Atomically write this dispatch's lane lock. Best-effort, never raises."""
+    rel = _lane_lock_path(session_id)
+    if not rel or not cwd:
+        return
+    path = os.path.join(cwd, rel)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        import datetime
+
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(
+                {
+                    "session_id": session_id,
+                    "pid": pid,
+                    "model": model,
+                    "started_at": datetime.datetime.now().isoformat(),
+                },
+                f,
+            )
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _lane_lock_release(session_id, cwd):
+    """Remove this dispatch's own lock on any terminal exit. Best-effort."""
+    rel = _lane_lock_path(session_id)
+    if not rel or not cwd:
+        return
+    with contextlib.suppress(OSError):
+        os.remove(os.path.join(cwd, rel))
 
 
 def _content_contains(path, needle):
@@ -845,6 +893,7 @@ def main(argv: list[str] | None = None) -> int:
         os.getpid(),
         **{k: v for k, v in _launch_facts.items() if v},
     )
+    _lane_lock_acquire(args.session_id or "unnamed", args.cwd, args.model, os.getpid())
     status = "done"
     exit_code = 0
     try:
@@ -880,6 +929,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         _registry_write(args.session_id or "unnamed", args.model, status, exit_code=exit_code)
         client.close()
+        _lane_lock_release(args.session_id or "unnamed", args.cwd)
     return 0 if status == "done" else 3
 
 
