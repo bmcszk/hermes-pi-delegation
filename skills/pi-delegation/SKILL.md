@@ -26,8 +26,8 @@ repo README; this skill is only the control loop.
 3. `pi_manage(action="wait", session_id=<id>)` blocks until the registry
    line is terminal and the pid is gone. Never sleep and poll. `wait` can
    answer `finished: false` with `status: unknown` while the worker is
-   alive; treat that as no signal and re-check via `list`
-   `last_activity_s` or by waiting on the client process itself.
+   alive; treat that as no signal and re-check via `list` `last_activity_s`
+   once the registry line lands, or wait on the client process itself.
 4. Verify the work on disk yourself: diff, gates, test counts. A completion
    report is a claim, not a result.
 
