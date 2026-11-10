@@ -69,6 +69,17 @@ the tree, not the words.
 - Commit one unit at a time so partial progress survives a timeout.
 - Keep each write payload small. One giant write dies mid-JSON and repeats
   until the correction budget is gone.
+- Stage via explicitly enumerated `git add <paths>`: a bare `add`/`-A` sweep
+  ships unrelated churn (state-file attr changes, lane artifacts) into the
+  commit and onto a pushed remote that no rewrite can clean without a force.
+- A prohibition the worker must not violate gets a mechanical gate (an
+  ignored path, a deny hook, a pre-commit check), never contract text alone.
+- A worker that stops with a blocked/spec-defect verdict plus partial commits
+  is acting correctly: believe the diagnosis, fix the contract and relaunch.
+- Embed a script in a contract only after mentally running each parse branch
+  against the manifest's shortest and longest lines; positional field-binding
+  bugs (a two-field line against a three-field `read`) hide there and
+  half-land before any worker catch.
 
 ## State files
 
