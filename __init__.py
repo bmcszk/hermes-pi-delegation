@@ -906,6 +906,52 @@ def _launch_session_id(cwd, worker_type, epic_id, task_slug):
     return f"task-{os.path.basename(os.path.normpath(cwd))}-{worker_type}"
 
 
+def _deployment_models(agent_dir):
+    """(known_aliases, default_model, readable) from one pi agent dir, for
+    preflight model validation. readable=False when the list cannot be
+    established at all; the caller then degrades to a warning."""
+    known, default = [], None
+    try:
+        with open(os.path.join(agent_dir, "models.json")) as f:
+            catalog = json.load(f)
+        for provider in (catalog.get("providers") or {}).values():
+            for entry in (provider or {}).get("models") or []:
+                alias = (entry or {}).get("id")
+                if isinstance(alias, str) and alias:
+                    known.append(alias)
+    except (OSError, ValueError, AttributeError):
+        return [], None, False
+    try:
+        with open(os.path.join(agent_dir, "settings.json")) as f:
+            default = json.load(f).get("defaultModel")
+    except (OSError, ValueError, AttributeError):
+        pass
+    return known, default, True
+
+
+def _model_check_rows(model, agent_dir):
+    """(failures, warnings) for the launch model argument against agent_dir."""
+    failures, warnings = [], []
+    known, default, readable = _deployment_models(agent_dir)
+    if model:
+        if readable and known and model not in known and model != default:
+            sample = ", ".join(sorted(known)[:5])
+            failures.append(
+                f"model - unknown alias {model!r} for this deployment "
+                f"({agent_dir}); valid ids include: {sample}"
+            )
+        elif not (readable and known):
+            warnings.append(
+                f"preflight warn: model {model} not verifiable against the deployment list"
+            )
+        return failures, warnings
+    warning = "preflight warn: no model passed - the worker runs pi's defaultModel"
+    if readable and default:
+        warning += f" ({default})"
+    warnings.append(warning)
+    return failures, warnings
+
+
 def _anchor_header(path):
     """Standard append-only lane-log header for a require_edit anchor."""
     slug = os.path.splitext(os.path.basename(path))[0]
@@ -923,13 +969,26 @@ def _preflight(
     min_tool_calls,
     max_nudges,
     worker_type="default",
+    model=None,
+    epic_id=None,
+    task_slug=None,
 ):
-    """Fail-fast contract and budget checks before a worker spawns.
+    """Fail-fast contract, budget, model and naming checks before a worker spawns.
 
-    Returns (create_anchor_ok, failures list). Every check names itself, so
-    the aggregated error lists ALL failed checks, not just the first.
+    Returns (failures, warnings). Every check names itself, so the aggregated
+    error lists ALL failed checks, not just the first; warnings carry the
+    degraded model checks.
     """
     failures = []
+    warnings = []
+    if epic_id and task_slug:
+        failures.append(
+            f"naming - epic_id and task_slug are mutually exclusive "
+            f"(epic_id wins the session id); drop one: epic_id={epic_id}, task_slug={task_slug}"
+        )
+    model_failures, model_warnings = _model_check_rows(model, WORKER_AGENT_DIR)
+    failures.extend(model_failures)
+    warnings.extend(model_warnings)
 
     if not os.path.isfile(os.path.expanduser(contract_path)):
         failures.append(f"contract - not found or unreadable: {contract_path}")
@@ -996,7 +1055,7 @@ def _preflight(
             "its root; add one of them (e.g. AGENTS.md)"
         )
 
-    return failures
+    return failures, warnings
 
 
 def _pi_launch_impl(
@@ -1080,23 +1139,25 @@ def _pi_launch_impl(
     if live_pid is not None:
         return {"error": f"session {session_id} already running (pid {live_pid})"}
 
-    failures = (
-        _preflight(
-            cwd,
-            contract_path,
-            require_edit,
-            create_anchor,
-            resolved_skills,
-            timeout_s,
-            wall_timeout_s,
-            min_tool_calls,
-            max_nudges,
-            worker_type,
-        )
-        + preflight_skill_failures
+    failures, preflight_warnings = _preflight(
+        cwd,
+        contract_path,
+        require_edit,
+        create_anchor,
+        resolved_skills,
+        timeout_s,
+        wall_timeout_s,
+        min_tool_calls,
+        max_nudges,
+        worker_type,
+        model,
+        epic_id,
+        task_slug,
     )
+    failures += preflight_skill_failures
     if failures:
         return {"error": "preflight: " + "; ".join(failures)}
+    warnings = preflight_warnings + warnings
 
     # Single-line POSIX command, shlex-quoted throughout. Double quotes around
     # $(cat ...) so command substitution happens at shell level.
@@ -1185,7 +1246,7 @@ def _pi_launch_impl(
         nudge_clause = "nudge: 0 - no correction loop"
     parts.extend(["--prompt", f"$(cat {shlex.quote(contract_path)})"])
 
-    command = "echo 'preflight ok: contract, require_edit anchors, skills, budgets, cwd' && "
+    command = "echo 'preflight ok: contract, anchors, skills, budgets, cwd, model, naming' && "
     budget_note = (
         f"budget: per-call <= {resolved_timeout}s, wall <= {resolved_wall}s, {nudge_clause}"
     )

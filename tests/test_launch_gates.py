@@ -130,8 +130,7 @@ def test_launch_warns_hermes_local_skill(tmp_skill):
         )
     )
     assert "error" not in result, result
-    assert result.get("warnings"), result
-    assert "outside pi skill discovery" in result["warnings"][0], result
+    assert any("outside pi skill discovery" in w for w in result.get("warnings", [])), result
     parts = shlex.split(result["command"])
     assert "--skill" in parts and skill in parts, parts
 
@@ -160,7 +159,9 @@ def test_launch_no_warning_for_agents_skill():
         )
     )
     assert "error" not in result, result
-    assert "warnings" not in result, result
+    # the skill check stays silent; model rows on an unverifiable alias are
+    # preflight's own concern and live in the model tests
+    assert not any("outside pi skill discovery" in w for w in result.get("warnings", [])), result
 
 
 def test_launch_schema_matches_impl_signature():
@@ -311,6 +312,7 @@ def test_launch_derives_session_id_from_cwd_when_epic_and_slug_missing():
 
 def test_launch_explicit_session_ids_still_win():
     # when epic_id and task_slug are both present
+    # (mutually exclusive since preflight validates naming; epic wins the id)
     both = _parse(
         pi_launch(
             {
@@ -336,8 +338,10 @@ def test_launch_explicit_session_ids_still_win():
         )
     )
 
-    # then the explicit ids still name the session
-    assert both["session_id"] == "epicWin-coder"
+    # then double naming is refused at preflight, single naming works
+    assert "error" in both, both
+    assert "mutually exclusive" in both["error"], both
+    assert "epic_id wins the session id" in both["error"], both
     assert slug_only["session_id"] == "task-slugWin-coder"
 
 
@@ -756,7 +760,7 @@ def test_preflight_happy_path_emits_ok_line(tmp_path):
     )
     assert "error" not in result, result
     assert (
-        "preflight ok: contract, require_edit anchors, skills, budgets, cwd" in result["command"]
+        "preflight ok: contract, anchors, skills, budgets, cwd, model, naming" in result["command"]
     ), result["command"]
 
 
