@@ -24,7 +24,10 @@ repo README; this skill is only the control loop.
    then exits 3). `epic_id` and `task_slug` name the session; run one
    worker per project at a time.
 3. `pi_manage(action="wait", session_id=<id>)` blocks until the registry
-   line is terminal and the pid is gone. Never sleep and poll.
+   line is terminal and the pid is gone. Never sleep and poll. `wait` can
+   answer `finished: false` with `status: unknown` while the worker is
+   alive; treat that as no signal and re-check via `list` `last_activity_s`
+   once the registry line lands, or wait on the client process itself.
 4. Verify the work on disk yourself: diff, gates, test counts. A completion
    report is a claim, not a result.
 
@@ -66,9 +69,23 @@ the tree, not the words.
 
 - One deliverable per dispatch; long work gets chained slices.
 - `require_edit` takes one exact file path, never a directory.
+- Aim `require_edit` at a file the contract itself orders the worker to
+  create or modify; aiming it at files whose edits predate the dispatch
+  burns the whole nudge budget on a satisfied tree and exits 3.
 - Commit one unit at a time so partial progress survives a timeout.
 - Keep each write payload small. One giant write dies mid-JSON and repeats
   until the correction budget is gone.
+- Stage via explicitly enumerated `git add <paths>`: a bare `add`/`-A` sweep
+  ships unrelated churn (state-file attr changes, lane artifacts) into the
+  commit and onto a pushed remote that no rewrite can clean without a force.
+- A prohibition the worker must not violate gets a mechanical gate (an
+  ignored path, a deny hook, a pre-commit check), never contract text alone.
+- A worker that stops with a blocked/spec-defect verdict plus partial commits
+  is acting correctly: believe the diagnosis, fix the contract and relaunch.
+- Embed a script in a contract only after mentally running each parse branch
+  against the manifest's shortest and longest lines; positional field-binding
+  bugs (a two-field line against a three-field `read`) hide there and
+  half-land before any worker catch.
 
 ## State files
 
