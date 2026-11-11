@@ -29,6 +29,7 @@ Generates one worker dispatch.
 | `require_edit` | no | Path or list of paths that must change for the run to count as done. Turns on the nudge gate. |
 | `min_tool_calls` | no | Tool calls required before the run counts as done. Needs `require_edit`. |
 | `max_nudges` | no | Nudges allowed before the gate gives up. Needs `require_edit`. |
+| `require_sentinel` | no | String that must appear in the `require_edit` file at exit. The registry row then records `deliverable: met\|unmet\|unchecked`, which `wait` and `list` pass through. Needs `require_edit`. See the sentinel pattern below. |
 | `timeout_s` | no | Idle budget per dispatch. Defaults to `PI_WORKER_TIMEOUT_S`, 900 s. |
 | `wall_timeout_s` | no | Hard ceiling on the whole dispatch. Defaults to `max(3600, timeout_s + 900)`. |
 
@@ -75,7 +76,7 @@ Registry and process control for running workers.
 | `kill` | Kill a dispatch by `session_id`. Own process group, so tool children die too. |
 | `doctor` | Report plugin freshness and schema parity between the registered schema and the implementation signature. |
 | `logs` | Tail the newest pi session log for a `session_id`. |
-| `wait` | Probe the registry until a `session_id` settles or `timeout_s` elapses. `unknown` means no registry entry for the session at all; a registered session always answers `running` (with `pid`, plus `last_activity_s` when a heartbeat age is available) or terminal (with the registry status and `exit_code` when the row carries one) — even when a whole-file registry rewrite is mid-flight, so a healthy worker is never mistaken for an unknown one. |
+| `wait` | Probe the registry until a `session_id` settles or `timeout_s` elapses. `unknown` means no registry entry for the session at all; a registered session always answers `running` (with `pid`, plus `last_activity_s` when a heartbeat age is available) or terminal (with the registry status, `exit_code`, and `deliverable` when the row carries them) — even when a whole-file registry rewrite is mid-flight, so a healthy worker is never mistaken for an unknown one. |
 | `steer` | Inject a message into a live worker's current run, or queue it for the next turn with `queue=true`. Landing is confirmed by the worker's next output, not the call. |
 
 #### wait's own ceiling: 1500 s
@@ -120,6 +121,59 @@ what was checked. `go test` stays behind the flag because it dominates the
 report's runtime; the cheap gates above are the ones that catch a broken tree.
 A gate that cannot be invoked (command missing, unwritable cwd, 120 s timeout)
 degrades to a `skipped` row instead of failing the report.
+
+### The sentinel pattern: a call count is not a deliverable
+
+`min_tool_calls` counts tool calls, and research is made of tool calls. A coder
+dispatch with `min_tool_calls=12` exited `0`, `nudges=0`, `satisfied=True` after
+35 calls that were ALL upstream `grep`/`read` — the `require_edit` file still
+held only its header, and the contract's commit, push and sentinel never
+happened. The parent only found out by reading the anchor file by hand.
+
+`require_sentinel` closes that hole. Name a string the contract requires the
+worker to write into the deliverable file; at exit the client greps that file
+for it and records the verdict:
+
+| Verdict | Meaning |
+| --- | --- |
+| `met` | the sentinel string is in the `require_edit` file |
+| `unmet` | the sentinel is absent, or the file is gone |
+| `unchecked` | no `require_sentinel` was requested |
+
+The **exit code is unchanged** — `unmet` is surfaced, not enforced, so a run
+that legitimately ends early still reports its real status. The point is that
+the parent's FIRST check catches it: `wait` and `list` pass `deliverable`
+straight through from the registry row.
+
+Example: a contract whose last step appends `TEXTS1-DONE` to the lane log.
+
+```json
+{
+  "contract_path": "/abs/contract.md",
+  "cwd": "/abs/project",
+  "worker_type": "coder",
+  "epic_id": "task-textS1",
+  "require_edit": ["/abs/project/.hermes/lane/textS1.md"],
+  "min_tool_calls": 12,
+  "require_sentinel": "TEXTS1-DONE"
+}
+```
+
+The contract then ends with the sentinel as the worker's last obligation:
+
+> Finish by appending the single line `TEXTS1-DONE` to
+> `.hermes/lane/textS1.md`. That line is your claim that the work is done.
+
+A research-only session leaves the file at its header, and `wait` answers:
+
+```json
+{"finished": true, "status": "done", "exit_code": 0,
+ "deliverable": "unmet"}
+```
+
+Launches without `require_sentinel` keep the old shape: no `deliverable` key on
+rows that never recorded one. `require_sentinel` without `require_edit` is a
+preflight error — the check has no file to grep.
 
 ### Notifications and exit codes
 

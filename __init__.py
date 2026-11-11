@@ -349,6 +349,15 @@ LAUNCH_PARAMS = {
         "minimum": 0,
         "description": "corrective prompts before giving up; needs require_edit",
     },
+    "require_sentinel": {
+        "type": "string",
+        "description": (
+            "optional string that must appear in the require_edit file at exit; the "
+            "registry row then records deliverable: met|unmet|unchecked (exit code "
+            "unchanged) and wait/list surface it. Needs require_edit. Closes the "
+            "satisfied-by-call-count hole: tool calls cannot prove a deliverable"
+        ),
+    },
     "timeout_s": {
         "type": "integer",
         "minimum": 30,
@@ -657,6 +666,8 @@ def _wait_result(session_id, entry):
             result["last_activity_s"] = age
     if entry.get("exit_code") is not None:
         result["exit_code"] = entry["exit_code"]
+    if entry.get("deliverable") is not None:
+        result["deliverable"] = entry["deliverable"]
     return result
 
 
@@ -1070,6 +1081,7 @@ def _preflight(
     model=None,
     epic_id=None,
     task_slug=None,
+    require_sentinel=None,
 ):
     """Fail-fast contract, budget, model and naming checks before a worker spawns.
 
@@ -1143,6 +1155,11 @@ def _preflight(
         failures.append(
             "budgets - min_tool_calls/max_nudges set without require_edit: the gate has no aim"
         )
+    if require_sentinel and not require_edit:
+        failures.append(
+            "require_sentinel - set without require_edit: the sentinel check has no file to "
+            "grep; name the deliverable file in require_edit"
+        )
 
     if not (
         os.path.isfile(os.path.join(cwd, ".beans.yml"))
@@ -1170,6 +1187,7 @@ def _pi_launch_impl(
     max_nudges=_UNSET,
     timeout_s=None,
     wall_timeout_s=None,
+    require_sentinel=None,
     create_anchor=False,
     auto=False,
     **_,
@@ -1251,6 +1269,7 @@ def _pi_launch_impl(
         model,
         epic_id,
         task_slug,
+        require_sentinel,
     )
     failures += preflight_skill_failures
     if failures:
@@ -1339,6 +1358,8 @@ def _pi_launch_impl(
         parts.extend(["--require-edit", targets])
         parts.extend(["--min-tool-calls", str(min_calls)])
         parts.extend(["--max-nudges", str(max_nudges_resolved)])
+        if require_sentinel:
+            parts.extend(["--require-sentinel", require_sentinel])
     else:
         # preflight already refuses min/max without require_edit
         nudge_clause = "nudge: 0 - no correction loop"
@@ -1348,6 +1369,8 @@ def _pi_launch_impl(
     budget_note = (
         f"budget: per-call <= {resolved_timeout}s, wall <= {resolved_wall}s, {nudge_clause}"
     )
+    if require_sentinel:
+        budget_note += f", deliverable: sentinel {require_sentinel!r}"
     command += f"echo {shlex.quote(budget_note)} && "
     command += " ".join(shlex.quote(p) for p in parts[:-1])
     # Last part keeps $(cat ...) unquoted at the outer level: shlex.quote would
@@ -1360,6 +1383,8 @@ def _pi_launch_impl(
         "worker_type": worker_type,
         "mode": mode,
     }
+    if require_sentinel:
+        result["require_sentinel"] = require_sentinel
     if auto:
         return _dispatch_command(command, cwd, session_id)
     if system_prompt is not None:
