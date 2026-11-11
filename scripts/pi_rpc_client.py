@@ -33,6 +33,8 @@ import threading
 import time
 from collections.abc import Callable
 
+import registry_log
+
 # 120 s was too short: real sweep contracts were killed mid-run and reported
 # as "no changes". Override per call with --timeout, or via PI_WORKER_TIMEOUT_S.
 DEFAULT_TIMEOUT_S = float(os.environ.get("PI_WORKER_TIMEOUT_S", "900"))
@@ -102,31 +104,26 @@ def _registry_patch(session_id, pid, **fields):
     raises. True when a line changed, so the caller can retry a stamp that
     raced its row into existence."""
     try:
-        lines = []
-        changed = False
-        if os.path.exists(REGISTRY_PATH):
-            with open(REGISTRY_PATH) as f:
-                for line in f:
-                    try:
-                        data = json.loads(line)
-                    except Exception:
-                        lines.append(line)
+        with registry_log.locked_registry(REGISTRY_PATH):
+            rows, torn = registry_log.read_registry_lines(REGISTRY_PATH)
+            changed = False
+            lines = []
+            for data in rows:
+                if (
+                    data.get("session") == session_id
+                    and data.get("pid") == pid
+                    and data.get("status") == "running"
+                ):
+                    merged = dict(data)
+                    merged.update(fields)
+                    if merged != data:
+                        lines.append(json.dumps(merged) + "\n")
+                        changed = True
                         continue
-                    if (
-                        data.get("session") == session_id
-                        and data.get("pid") == pid
-                        and data.get("status") == "running"
-                    ):
-                        merged = dict(data)
-                        merged.update(fields)
-                        if merged != data:
-                            lines.append(json.dumps(merged) + "\n")
-                            changed = True
-                            continue
-                    lines.append(line)
-        if changed:
-            with open(REGISTRY_PATH, "w") as f:
-                f.writelines(lines)
+                lines.append(json.dumps(data) + "\n")
+            lines.extend(line + "\n" for line in torn)
+            if changed:
+                registry_log.write_registry_lines(REGISTRY_PATH, lines)
     except Exception:
         pass
 
@@ -271,9 +268,7 @@ def _registry_write(session_id, model, status, pid=None, exit_code=None):
             entry["finished"] = now
             _registry_update_running(session_id, entry)
         else:
-            os.makedirs(os.path.dirname(REGISTRY_PATH), exist_ok=True)
-            with open(REGISTRY_PATH, "a") as f:
-                f.write(json.dumps(entry) + "\n")
+            registry_log.append_registry_line(REGISTRY_PATH, json.dumps(entry))
     except Exception:
         pass
 
@@ -288,32 +283,27 @@ def _registry_update_running(session_id, entry):
     (crash-before-write case).
     """
     try:
-        lines = []
-        replaced = False
-        exists = False
-        if os.path.exists(REGISTRY_PATH):
-            with open(REGISTRY_PATH) as f:
-                for line in f:
-                    try:
-                        data = json.loads(line)
-                    except Exception:
-                        lines.append(line)
+        with registry_log.locked_registry(REGISTRY_PATH):
+            rows, torn = registry_log.read_registry_lines(REGISTRY_PATH)
+            replaced = False
+            exists = False
+            lines = []
+            for data in rows:
+                if data.get("session") == session_id and data.get("pid") == entry["pid"]:
+                    exists = True
+                    if not replaced and data.get("status") == "running":
+                        merged = dict(data)
+                        merged.update(entry)
+                        lines.append(json.dumps(merged) + "\n")
+                        replaced = True
                         continue
-                    if data.get("session") == session_id and data.get("pid") == entry["pid"]:
-                        exists = True
-                        if not replaced and data.get("status") == "running":
-                            merged = dict(data)
-                            merged.update(entry)
-                            lines.append(json.dumps(merged) + "\n")
-                            replaced = True
-                            continue
-                    lines.append(line)
-        if exists and not replaced:
-            return
-        if not replaced:
-            lines.append(json.dumps(entry) + "\n")
-        with open(REGISTRY_PATH, "w") as f:
-            f.writelines(lines)
+                lines.append(json.dumps(data) + "\n")
+            lines.extend(line + "\n" for line in torn)
+            if exists and not replaced:
+                return
+            if not replaced:
+                lines.append(json.dumps(entry) + "\n")
+            registry_log.write_registry_lines(REGISTRY_PATH, lines)
     except Exception:
         pass
 

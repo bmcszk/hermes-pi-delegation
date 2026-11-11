@@ -11,6 +11,8 @@ import subprocess
 import sys
 import time
 
+import registry_log
+
 # Constants
 REGISTRY_PATH = os.path.expanduser("~/.hermes/logs/pi-agents.jsonl")
 CLIENT_PATH = os.path.join(os.path.dirname(__file__), "scripts", "pi_rpc_client.py")
@@ -62,47 +64,66 @@ WORKER_TIMEOUT_S = int(os.environ.get("PI_WORKER_TIMEOUT_S", "900"))
 WAIT_CEILING_S = 1500
 _UNSET = object()  # distinguishes "caller passed it" from the signature default
 
+# why the last registry read skipped a line; the next read resets it
+_last_registry_warning = None
+
 
 def _read_registry():
-    """Return list of parsed registry entries. Best-effort, never raises."""
-    entries = []
+    """Return list of parsed registry entries. Best-effort, never raises.
+
+    A torn line (a write that landed in halves, or a trailing write caught
+    mid-append) is skipped with a warning instead of hiding every other row:
+    one bad line must never cost the whole registry.
+    """
+    global _last_registry_warning
+    _last_registry_warning = None
     try:
-        if not os.path.exists(REGISTRY_PATH):
-            return entries
-        with open(REGISTRY_PATH) as f:
-            for line in f:
-                try:
-                    entries.append(json.loads(line))
-                except Exception:
-                    continue
-    except Exception:
-        pass
+        entries, torn = registry_log.read_registry(REGISTRY_PATH)
+    except Exception as exc:  # a missing or unreadable file answers an empty list
+        _last_registry_warning = f"registry unreadable: {exc}"
+        return []
+    if torn:
+        _last_registry_warning = (
+            f"skipped {len(torn)} torn line(s) in {REGISTRY_PATH}; "
+            f"run pi_manage(action='doctor') or _registry_repair() to quarantine them"
+        )
+        logging.warning(_last_registry_warning)
     return entries
+
+
+def _registry_repair(path=None):
+    """Quarantine torn registry lines into <registry>.corrupt and rewrite clean.
+
+    The rewrite is atomic, so a reader never sees the intermediate file. Lines
+    that do not parse are preserved verbatim in the .corrupt file: they are the
+    only record of whatever tore them.
+    """
+    path = path or REGISTRY_PATH
+    with registry_log.locked_registry(path):
+        rows, torn = registry_log.read_registry_lines(path)
+        corrupt_path = f"{path}.corrupt"
+        if torn:
+            with open(corrupt_path, "a") as corrupt:
+                corrupt.writelines(line + "\n" for line in torn)
+            registry_log.write_registry_lines(path, [json.dumps(row) + "\n" for row in rows])
+    return {"kept": len(rows), "quarantined": len(torn), "corrupt_path": corrupt_path}
 
 
 def _registry_update(session_id, pid, **fields):
     """Read-modify-write the registry line matching session+pid. Best-effort."""
     try:
-        if not os.path.exists(REGISTRY_PATH):
-            return
-        lines = []
-        changed = False
-        with open(REGISTRY_PATH) as f:
-            for line in f:
-                try:
-                    data = json.loads(line)
-                except Exception:
-                    lines.append(line)
-                    continue
+        with registry_log.locked_registry(REGISTRY_PATH):
+            rows, torn = registry_log.read_registry_lines(REGISTRY_PATH)
+            changed = False
+            lines = []
+            for data in rows:
                 if data.get("session") == session_id and data.get("pid") == pid:
                     data.update(fields)
-                    lines.append(json.dumps(data) + "\n")
                     changed = True
-                else:
-                    lines.append(line)
-        if changed:
-            with open(REGISTRY_PATH, "w") as f:
-                f.writelines(lines)
+                lines.append(json.dumps(data) + "\n")
+            lines.extend(line + "\n" for line in torn)
+            if changed:
+                registry_log.write_registry_lines(REGISTRY_PATH, lines)
     except Exception:
         pass
 

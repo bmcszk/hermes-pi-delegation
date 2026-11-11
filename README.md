@@ -146,6 +146,38 @@ after worker exit. The lock makes that contention visible instead of
 silent: a concurrent gate run in the same worktree is exactly the
 build-cache collision this lock exists to catch.
 
+### The registry log is line-delimited JSON, end to end
+
+Every dispatch appends its lifecycle rows to `~/.hermes/logs/pi-agents.jsonl`
+(`done`/`running`/`killed`/`timeout`), and `list`/`wait`/`salvage_report` read
+it back. Concurrent dispatches once tore that file — 4 unparseable lines of 791
+— because a second writer could land mid-record and a whole-file rewrite could
+swap in a shorter file while an append sat at the old offset.
+
+Now every mutation — append, patch, terminal merge — holds one exclusive lock
+(`pi-agents.jsonl.lock`) and replaces the file through a temp file plus an
+atomic rename, so a record is whole from any reader's point of view, or it is
+not there yet. An append still keeps the single `write()` call for the whole
+record plus its newline.
+
+**A torn line never costs you the registry.** Readers skip a line that does not
+parse and report it in `_last_registry_warning` (also logged as a warning),
+so one truncated record cannot hide every other row from `list`, `wait`, or
+`salvage_report`.
+
+**Recovery.** `_registry_repair()` rewrites the registry clean: every
+parseable row is kept, every unparseable line is moved verbatim into
+`pi-agents.jsonl.corrupt` (append-only — nothing is thrown away) and the file
+is replaced atomically. Run it from a python shell in the plugin directory:
+
+```sh
+python3 -c 'import __init__ as p; print(p._registry_repair())'
+# {'kept': 791, 'quarantined': 4, 'corrupt_path': '...pi-agents.jsonl.corrupt'}
+```
+
+A fully parseable registry is left untouched (no rewrite, no mtime change), so
+the repair is safe to run as a routine check.
+
 ### Worker isolation directory
 
 Every dispatch points pi at `~/.pi/agent-worker` (`WORKER_AGENT_DIR`). The plugin
