@@ -483,6 +483,13 @@ def register(ctx):
                     "minimum": 1,
                     "description": "wait: seconds between probes",
                 },
+                "go_tests": {
+                    "type": "boolean",
+                    "description": (
+                        "salvage_report: for a recorded cwd with go.mod, also run "
+                        "'go test ./...' (off by default: it dominates the report's runtime)"
+                    ),
+                },
             },
             ["action"],
         ),
@@ -552,6 +559,7 @@ def _pi_manage_impl(
     poll_s=None,
     message=None,
     queue=False,
+    go_tests=False,
     **_,
 ):
     if action == "steer":
@@ -574,7 +582,7 @@ def _pi_manage_impl(
     if action == "logs":
         return _session_logs(session_id, lines)
     if action == "salvage_report":
-        return _salvage_report(session_id, lines)
+        return _salvage_report(session_id, lines, go_tests)
 
     if action == "list":
         agents = _read_registry()
@@ -674,7 +682,6 @@ def _wait_for_completion(session_id, budget, poll):
 
 
 def _git_readonly(cwd, *args):
-    """Run a read-only git command in cwd. Returns (ok, stdout)."""
     try:
         proc = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=30)
         return proc.returncode == 0, (proc.stdout if proc.returncode == 0 else proc.stderr)
@@ -684,6 +691,65 @@ def _git_readonly(cwd, *args):
 
 def _base_is_valid(cwd, base):
     return bool(base) and bool(_git_readonly(cwd, "cat-file", "-e", f"{base}^{{commit}}")[0])
+
+
+# Quick gates per project type, chosen from the RECORDED cwd's root markers. A
+# worker in another repo must never be graded by the plugin's own checks: one
+# live Go session surfaced 23 pre-existing lint errors from this tree.
+PROJECT_MARKERS = (
+    ("go.mod", "go"),
+    ("pyproject.toml", "python"),
+    ("plugin.yaml", "plugin"),
+)
+
+
+def _project_type(cwd):
+    """Project type of the recorded cwd: go, python, plugin, or unknown."""
+    if not cwd:
+        return "unknown"
+    for marker, kind in PROJECT_MARKERS:
+        if os.path.isfile(os.path.join(cwd, marker)):
+            return kind
+    return "unknown"
+
+
+def _gate_commands(project_type, go_tests):
+    """(name, command) pairs for one project type; go test stays opt-in."""
+    if project_type == "go":
+        gates = [
+            (
+                "gofmt",
+                "unformatted=$(gofmt -l .) || exit 1; "
+                '[ -z "$unformatted" ] || { echo "$unformatted"; exit 1; }',
+            ),
+            ("go-build", "go build ./..."),
+        ]
+        if go_tests:
+            gates.append(("go-test", "go test ./..."))
+        return gates
+    if project_type == "python":
+        return [("ruff-check", "uvx ruff check ."), ("compileall", "python -m compileall -q .")]
+    if project_type == "plugin":
+        return [
+            ("uvx-ruff-check", "uvx ruff check ."),
+            ("compileall-plugin", "python -m compileall -q __init__.py scripts tests"),
+        ]
+    return []
+
+
+def _project_gates(cwd, go_tests=False):
+    """Gate rows for the recorded cwd's project type, plus a named skip when
+    the type cannot be established, so an empty gate list never reads as pass."""
+    project_type = _project_type(cwd)
+    commands = _gate_commands(project_type, go_tests)
+    if not commands:
+        reason = (
+            "no recorded cwd for this row"
+            if not cwd
+            else f"no project marker (go.mod, pyproject.toml, plugin.yaml) in {cwd}"
+        )
+        return [{"name": "project-type", "command": "", "ok": False, "skipped": reason}]
+    return [_gate_row(name, command, cwd) for name, command in commands]
 
 
 def _gate_row(name, command, cwd):
@@ -708,7 +774,7 @@ def _gate_row(name, command, cwd):
         }
 
 
-def _salvage_report(session_id, lines=12):
+def _salvage_report(session_id, lines=12, go_tests=False):
     """Post-exit state collection for one session, in one call, shaped to
     paste as the on-disk state section of a continuation contract. Read-only,
     best-effort: every leg degrades to a named skip instead of raising.
@@ -776,12 +842,8 @@ def _salvage_report(session_id, lines=12):
             if k in frames
         },
         "lane_lock": lane_lock_row,
-        "gates": [
-            _gate_row("uvx-ruff-check", "uvx ruff check .", cwd),
-            _gate_row(
-                "compileall-plugin", "python -m compileall -q __init__.py scripts tests", cwd
-            ),
-        ],
+        "project_type": _project_type(cwd),
+        "gates": _project_gates(cwd, go_tests),
     }
 
 

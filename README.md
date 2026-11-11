@@ -100,6 +100,27 @@ the session is still settling — waiting again is safe, the loop is stateless.
 A budget at or under 1500 s comes back unclamped (`clamped: false`, no hint).
 
 
+### `salvage_report` quick gates follow the recorded cwd
+
+`salvage_report` answers with the post-exit state of one dispatch; its `gates`
+array is the quick check of the tree the WORKER worked in. Detection reads the
+root markers of the row's recorded `cwd`, never the caller's tree — a Go worker
+once came back graded by this plugin's own lint, with 23 pre-existing errors
+from an unrelated repo leaking into the report.
+
+| Recorded cwd has | `project_type` | Gates (run inside that cwd) |
+| --- | --- | --- |
+| `go.mod` | `go` | `gofmt -l .` (fails, listing files, when anything is unformatted), `go build ./...`; `go test ./...` only with `go_tests=true` |
+| `pyproject.toml` | `python` | `uvx ruff check .`, `python -m compileall -q .` |
+| `plugin.yaml` | `plugin` | `uvx ruff check .`, `python -m compileall -q __init__.py scripts tests` (this plugin's own report) |
+| no marker | `unknown` | one `project-type` row carrying `skipped: <reason>` — an empty gate list never reads as a pass |
+
+The result also carries `project_type`, so a continuation contract can state
+what was checked. `go test` stays behind the flag because it dominates the
+report's runtime; the cheap gates above are the ones that catch a broken tree.
+A gate that cannot be invoked (command missing, unwritable cwd, 120 s timeout)
+degrades to a `skipped` row instead of failing the report.
+
 ### Notifications and exit codes
 
 Background notifications report the exit code of the **wrapper**, not of the
