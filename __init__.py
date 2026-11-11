@@ -57,6 +57,9 @@ TOOLSETS = {
 # Prompt budget handed to the worker. The client default (120 s) is far too
 # short for a real sweep: workers were being killed mid-contract.
 WORKER_TIMEOUT_S = int(os.environ.get("PI_WORKER_TIMEOUT_S", "900"))
+# wait clamps its own budget below the host's 1600 s tool-call ceiling: a wait
+# that rides that limit loses the whole turn instead of answering.
+WAIT_CEILING_S = 1500
 _UNSET = object()  # distinguishes "caller passed it" from the signature default
 
 
@@ -447,7 +450,12 @@ def register(ctx):
                 "timeout_s": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "wait: seconds to keep probing; 0 means a single probe",
+                    "description": (
+                        "wait: seconds to keep probing; 0 means a single probe. "
+                        "Clamped to 1500s (WAIT_CEILING_S), safely under the host's "
+                        "1600s tool-call ceiling; a clamped answer carries "
+                        "clamped/resumed_by=call-wait-again"
+                    ),
                 },
                 "poll_s": {
                     "type": "integer",
@@ -530,9 +538,16 @@ def _pi_manage_impl(
     if action == "wait":
         if not session_id:
             return {"error": "session_id required for wait"}
-        budget = max(0, int(timeout_s or 0))
+        requested = max(0, int(timeout_s or 0))
+        budget = min(requested, WAIT_CEILING_S)
         poll = max(1, int(poll_s or 1))
-        return _wait_for_completion(session_id, budget, poll)
+        result = _wait_for_completion(session_id, budget, poll)
+        result["requested_timeout_s"] = requested
+        result["timeout_s"] = budget
+        result["clamped"] = budget < requested
+        if result["clamped"] and not result["finished"]:
+            result["resumed_by"] = "call-wait-again"
+        return result
     if action == "doctor":
         return _doctor()
     if action == "logs":

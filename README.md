@@ -78,6 +78,28 @@ Registry and process control for running workers.
 | `wait` | Probe the registry until a `session_id` settles or `timeout_s` elapses. `unknown` means no registry entry for the session at all; a registered session always answers `running` (with `pid`, plus `last_activity_s` when a heartbeat age is available) or terminal (with the registry status and `exit_code` when the row carries one) — even when a whole-file registry rewrite is mid-flight, so a healthy worker is never mistaken for an unknown one. |
 | `steer` | Inject a message into a live worker's current run, or queue it for the next turn with `queue=true`. Landing is confirmed by the worker's next output, not the call. |
 
+#### wait's own ceiling: 1500 s
+
+A host's tool-call layer caps one call (Hermes: 1600 s). A `wait` that rides
+that limit does not return a late answer — it loses the turn, and the caller
+sees a bare timeout error with no state at all. Six of those cost ~2.6 h in one
+live session before this clamp existed.
+
+So `wait` clamps `timeout_s` to `WAIT_CEILING_S` (1500 s), comfortably under
+the host's ceiling, and answers at the clamp instead of the requested budget:
+
+```json
+{"finished": false, "status": "running", "pid": 4711,
+ "requested_timeout_s": 99999, "timeout_s": 1500,
+ "clamped": true, "resumed_by": "call-wait-again"}
+```
+
+`clamped` says the budget was shortened and `timeout_s` says to what; the
+session itself is untouched. `resumed_by: call-wait-again` appears only while
+the session is still settling — waiting again is safe, the loop is stateless.
+A budget at or under 1500 s comes back unclamped (`clamped: false`, no hint).
+
+
 ### Notifications and exit codes
 
 Background notifications report the exit code of the **wrapper**, not of the
