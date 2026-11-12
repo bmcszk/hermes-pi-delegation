@@ -71,9 +71,7 @@ def _client_cmdline(session_id):
         pytest.param(
             _client_cmdline("task-foo-coder") + " --timeout 900", True, id="with-suffix-args"
         ),
-        pytest.param(
-            _client_cmdline("task-foo-coder2"), False, id="longer-id-no-match"
-        ),
+        pytest.param(_client_cmdline("task-foo-coder2"), False, id="longer-id-no-match"),
         pytest.param(
             "python3 /x/pi_rpc_client.py --session-id task-foo-coder-extra --cwd /y",
             False,

@@ -1,3 +1,4 @@
+import datetime
 import glob
 import hashlib
 import importlib.util
@@ -68,6 +69,10 @@ WORKER_TIMEOUT_S = int(os.environ.get("PI_WORKER_TIMEOUT_S", "900"))
 # wait clamps its own budget below the host's 1600 s tool-call ceiling: a wait
 # that rides that limit loses the whole turn instead of answering.
 WAIT_CEILING_S = 1500
+# Age at which an unresolved pending-dispatch row stops meaning "slow client"
+# and starts meaning "never dispatched": wait then classifies via pgrep
+# instead of burning the rest of its budget.
+DISPATCH_GRACE_S = 25
 _UNSET = object()  # distinguishes "caller passed it" from the signature default
 
 # why the last registry read skipped a line; the next read resets it
@@ -178,14 +183,24 @@ def _lane_lock_info(cwd, session_id):
 
 
 def _newest_registry_entry(session_id):
-    """Latest registry entry for session_id (by started, then finished), or None."""
+    """Latest registry entry for session_id (by started, then finished), or None.
+
+    A pid-bearing row always outranks a pending-dispatch row for the same
+    session: a real run must never be shadowed by an older intent row, even
+    on timestamp skew.
+    """
     newest = None
+    newest_pid_row = None
     for entry in _read_registry():
         if entry.get("session") != session_id:
             continue
+        if entry.get("pid") and (
+            newest_pid_row is None or _entry_stamp(entry) >= _entry_stamp(newest_pid_row)
+        ):
+            newest_pid_row = entry
         if newest is None or _entry_stamp(entry) >= _entry_stamp(newest):
             newest = entry
-    return newest
+    return newest_pid_row or newest
 
 
 def _entry_stamp(entry):
@@ -196,8 +211,11 @@ def _entry_stamp(entry):
 def _wait_finished(entry):
     """True when the entry's pid is gone; the registry status alone never settles it
     (a killed line can still carry a live pid). A gone pid settles a run even when
-    the exit status write never landed.
+    the exit status write never landed. A pending-dispatch intent row is never
+    finished: it has no pid to lose.
     """
+    if entry.get("status") == "pending-dispatch":
+        return False
     pid = entry.get("pid")
     return not (bool(pid) and _pid_alive(pid))
 
@@ -618,6 +636,8 @@ def _pi_manage_impl(
         # a stale lock (pid dead, crash leftover) belongs on the DEAD row too,
         # which is exactly where the crashed worker's row is still running.
         for agent in agents:
+            if agent.get("status") == "pending-dispatch":
+                agent["pending_age_s"] = _row_age_s(agent)
             lock = _lane_lock_info(agent.get("cwd"), agent.get("session"))
             if lock is not None:
                 agent["lane_lock"] = {"present": True, "stale": lock["stale"]}
@@ -630,39 +650,84 @@ def _pi_manage_impl(
         if not session_id:
             return {"error": "session_id required for kill"}
         seen_dead_pid = None
+        pending_seen = False
         for entry in _read_registry():
-            if entry.get("session") == session_id:
-                pid = entry.get("pid")
-                # Defensive: verify pid exists and is a pi_rpc_client process.
-                try:
-                    os.kill(pid, 0)
-                except Exception:
-                    _registry_update(session_id, pid, status="dead", finished=_now_iso())
-                    seen_dead_pid = pid
-                    continue
-                try:
-                    with open(f"/proc/{pid}/cmdline", "rb") as f:
-                        cmdline = f.read().decode("utf-8", "replace")
-                    if "pi_rpc_client" not in cmdline:
-                        return {
-                            "error": f"pid {pid} is not a pi_rpc_client process; refusing to signal"
-                        }
-                except Exception:
-                    return {"error": f"cannot verify cmdline of pid {pid}"}
-                os.killpg(pid, signal.SIGTERM)  # client AND its pi + tool children
-                _registry_update(
-                    session_id, pid, status="killed", exit_code=143, finished=_now_iso()
-                )
-                return {
-                    "status": f"SIGTERM sent to pgid {pid} ({session_id})",
-                    "recovery": f"pi_manage(action='salvage_report', session_id='{session_id}')",
-                }
+            if entry.get("session") != session_id:
+                continue
+            if entry.get("status") == "pending-dispatch":
+                pending_seen = True
+                continue
+            pid = entry.get("pid")
+            # Defensive: verify pid exists and is a pi_rpc_client process.
+            try:
+                os.kill(pid, 0)
+            except Exception:
+                _registry_update(session_id, pid, status="dead", finished=_now_iso())
+                seen_dead_pid = pid
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmdline = f.read().decode("utf-8", "replace")
+                if "pi_rpc_client" not in cmdline:
+                    return {
+                        "error": f"pid {pid} is not a pi_rpc_client process; refusing to signal"
+                    }
+            except Exception:
+                return {"error": f"cannot verify cmdline of pid {pid}"}
+            os.killpg(pid, signal.SIGTERM)  # client AND its pi + tool children
+            _registry_update(session_id, pid, status="killed", exit_code=143, finished=_now_iso())
+            return {
+                "status": f"SIGTERM sent to pgid {pid} ({session_id})",
+                "recovery": f"pi_manage(action='salvage_report', session_id='{session_id}')",
+            }
+        if pending_seen:
+            live = _client_pids(session_id)
+            if not live:
+                _registry_update(session_id, None, status="aborted", finished=_now_iso())
+                return {"status": f"pending dispatch cancelled for {session_id}"}
+            pid = live[0]
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmdline = f.read().decode("utf-8", "replace")
+                if "pi_rpc_client" not in cmdline or session_id not in cmdline:
+                    return {
+                        "error": f"pid {pid} is not a pi_rpc_client process; refusing to signal"
+                    }
+            except Exception:
+                return {"error": f"cannot verify cmdline of pid {pid}"}
+            os.killpg(pid, signal.SIGTERM)
+            _registry_update(session_id, None, status="killed", exit_code=143, finished=_now_iso())
+            return {
+                "status": f"SIGTERM sent to pgid {pid} (unregistered client, {session_id})",
+                "recovery": f"pi_manage(action='salvage_report', session_id='{session_id}')",
+            }
         if seen_dead_pid is not None:
             return {
                 "status": f"session {session_id} already dead (pid {seen_dead_pid}, marked dead)",
                 "recovery": f"pi_manage(action='salvage_report', session_id='{session_id}')",
             }
-        return {"error": f"Session {session_id} not found in registry"}
+        if _client_pids(session_id):
+            pid = _client_pids(session_id)[0]
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmdline = f.read().decode("utf-8", "replace")
+                if "pi_rpc_client" not in cmdline or session_id not in cmdline:
+                    return {
+                        "error": f"pid {pid} is not a pi_rpc_client process; refusing to signal"
+                    }
+            except Exception:
+                return {"error": f"cannot verify cmdline of pid {pid}"}
+            os.killpg(pid, signal.SIGTERM)
+            return {
+                "status": f"SIGTERM sent to pgid {pid} (unregistered client, {session_id})",
+                "recovery": f"pi_manage(action='salvage_report', session_id='{session_id}')",
+            }
+        return {
+            "error": (
+                f"Session {session_id} not found in registry and no process found: "
+                "run the returned launch command in background"
+            )
+        }
 
 
 def _tree_summary(cwd, base):
@@ -694,10 +759,19 @@ def _tree_summary(cwd, base):
 def _wait_result(session_id, entry):
     """Derived wait answer for one registry row: running/terminal/last_activity_s.
 
-    unknown is reserved for a session with no registry rows at all; a known
-    row always yields its derived fields, even when a concurrent whole-file
-    rewrite makes one read land partial.
+    A pending-dispatch intent row surfaces its age as pending_age_s and is
+    never derived into a terminal answer. unknown is reserved for a session
+    with no registry rows at all; a known row always yields its derived
+    fields, even when a concurrent whole-file rewrite makes one read land
+    partial.
     """
+    if entry.get("status") == "pending-dispatch":
+        return {
+            "finished": False,
+            "status": "pending-dispatch",
+            "pid": None,
+            "pending_age_s": _row_age_s(entry),
+        }
     status = entry.get("status") or "running"
     pid = entry.get("pid")
     result = {"finished": _wait_finished(entry), "status": status, "pid": pid}
@@ -722,20 +796,155 @@ def _wait_for_completion(session_id, budget, poll):
 
     Never answers unknown for a registered session: unknown comes only from
     the caller-side probe (no registry rows for this session at all), never
-    from inside the loop.
+    from inside the loop. An aged pending row and a row-less session classify
+    immediately via pgrep instead of burning the remaining budget.
     """
     deadline = time.monotonic() + budget
     while True:
         entry = _newest_registry_entry(session_id)
         if entry is None:
-            if time.monotonic() >= deadline:
-                return {"finished": False, "status": "unknown"}
-            time.sleep(poll)
-            continue
+            return _classify_unregistered(session_id)
         result = _wait_result(session_id, entry)
         if result["finished"] or deadline - time.monotonic() < poll:
             return result
+        if entry.get("status") == "pending-dispatch" and _row_age_s(entry) >= DISPATCH_GRACE_S:
+            return _classify_aged_pending(session_id, entry)
         time.sleep(poll)
+
+
+def _row_age_s(entry):
+    """Seconds since the row's started stamp, best-effort; 0 when unreadable."""
+    try:
+        started = datetime.datetime.fromisoformat(entry.get("started"))
+        return max(0, round((datetime.datetime.now() - started).total_seconds()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _client_pid_pattern(session_id):
+    """pgrep -f regex matching this session's client command, boundary-anchored
+    so task-foo-coder never matches task-foo-coder2."""
+    escaped = re.escape(session_id)
+    return rf"pi_rpc_client\.py --session-id {escaped}( |$)"
+
+
+def _client_pids(session_id):
+    """Live pids running this session's pi_rpc_client, per pgrep -f.
+
+    A missing or unreadable pgrep degrades to no-hit (the caller then gives
+    the vaguer hint) instead of raising.
+    """
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-f", "--", _client_pid_pattern(session_id)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return []
+    return [int(pid) for pid in proc.stdout.split() if pid.isdigit()]
+
+
+def _classify_unregistered(session_id):
+    """Immediate wait answer for a session with no registry rows at all."""
+    pids = _client_pids(session_id)
+    if pids:
+        return {
+            "finished": False,
+            "status": "unregistered-client",
+            "pid": pids[0],
+            "hint": (
+                "worker process alive but never registered; check "
+                f"pi_manage(action='logs', session_id='{session_id}') or kill"
+            ),
+        }
+    return {
+        "finished": False,
+        "status": "unknown",
+        "hint": "no launch record and no process for this id - check session_id",
+    }
+
+
+def _classify_aged_pending(session_id, entry):
+    """Immediate wait answer for a pending-dispatch row past its grace."""
+    age = _row_age_s(entry)
+    pids = _client_pids(session_id)
+    if pids:
+        return {
+            "finished": False,
+            "status": "unregistered-client",
+            "pid": pids[0],
+            "hint": (
+                "worker process alive but never registered; check "
+                f"pi_manage(action='logs', session_id='{session_id}') or kill"
+            ),
+        }
+    return {
+        "finished": False,
+        "status": "never-dispatched",
+        "command_age_s": age,
+        "hint": (
+            f"command issued {age}s ago, no process found: run the returned command "
+            f"in background, or pi_launch(auto=true); "
+            f"pi_manage(action='kill', session_id='{session_id}') clears the pending row"
+        ),
+    }
+
+
+def _pending_row(session_id):
+    """The unresolved pending-dispatch row for session_id, or None."""
+    for entry in _read_registry():
+        if entry.get("session") == session_id and entry.get("status") == "pending-dispatch":
+            return entry
+    return None
+
+
+def _record_pending_dispatch(session_id, cwd, mode):
+    """Write the launch intent row, replacing any unresolved pending row for the
+    same session (single-pending invariant). Best-effort: False on failure."""
+    row = {
+        "session": session_id,
+        "status": "pending-dispatch",
+        "pid": None,
+        "mode": mode,
+        "cwd": cwd,
+        "started": _now_iso(),
+    }
+    try:
+        with registry_log.locked_registry(REGISTRY_PATH):
+            rows, torn = registry_log.read_registry_lines(REGISTRY_PATH)
+            kept = []
+            for data in rows:
+                if data.get("session") == session_id and data.get("status") == "pending-dispatch":
+                    continue
+                kept.append(json.dumps(data) + "\n")
+            kept.append(json.dumps(row) + "\n")
+            registry_log.write_registry_lines(REGISTRY_PATH, kept + [t + "\n" for t in torn])
+        return True
+    except Exception:
+        return False
+
+
+def _update_pending_dispatch(session_id, pid, log_path):
+    """Stamp the spawned bash wrapper's pid and log path onto the pending row.
+    Best-effort: never fails the dispatch."""
+    try:
+        with registry_log.locked_registry(REGISTRY_PATH):
+            rows, torn = registry_log.read_registry_lines(REGISTRY_PATH)
+            changed = False
+            lines = []
+            for data in rows:
+                if data.get("session") == session_id and data.get("status") == "pending-dispatch":
+                    data["pid"] = pid
+                    data["log_path"] = log_path
+                    changed = True
+                lines.append(json.dumps(data) + "\n")
+            lines.extend(t + "\n" for t in torn)
+            if changed:
+                registry_log.write_registry_lines(REGISTRY_PATH, lines)
+    except Exception:
+        pass
 
 
 def _git_readonly(cwd, *args):
@@ -839,6 +1048,13 @@ def _salvage_report(session_id, lines=12, go_tests=False):
     entry = _newest_registry_entry(session_id)
     if entry is None:
         return {"finished": False, "status": "unknown"}
+    if entry.get("status") == "pending-dispatch":
+        return {
+            "finished": False,
+            "status": "pending-dispatch",
+            "session": session_id,
+            "pending_age_s": _row_age_s(entry),
+        }
     cwd = entry.get("cwd")
     base = entry.get("base")
     valid_base = _base_is_valid(cwd, base) if cwd else False
@@ -917,6 +1133,13 @@ def _verify_session(session_id):
     entry = _newest_registry_entry(session_id)
     if entry is None:
         return {"finished": False, "status": "unknown"}
+    if entry.get("status") == "pending-dispatch":
+        return {
+            "finished": False,
+            "status": "pending-dispatch",
+            "session": session_id,
+            "pending_age_s": _row_age_s(entry),
+        }
     cwd = entry.get("cwd")
     tree = _tree_summary(cwd, entry.get("base"))
     uncommitted = tree["dirty"] if isinstance(tree["dirty"], int) else None
@@ -1007,6 +1230,7 @@ def _dispatch_command(command, cwd, session_id):
             )
     except OSError as exc:
         return {"error": f"$dispatch failed to spawn: {exc}", "log": log_path}
+    _update_pending_dispatch(session_id, proc.pid, log_path)
     return {
         "dispatched": True,
         "pid": proc.pid,
@@ -1054,11 +1278,11 @@ def _transcript_for(session_id):
 
     Registry log_path first (the client learned pi's real transcript even when
     its filename lacks the session slug), then the legacy slug glob for rows
-    recorded before that fix.
+    recorded before that fix. A pending-dispatch row resolves nothing: its
+    log_path, if any, points at the dispatch log, not a transcript.
     """
-
     entry = _newest_registry_entry(session_id)
-    if entry is not None:
+    if entry is not None and entry.get("status") != "pending-dispatch":
         registered = entry.get("log_path")
         if registered and os.path.isfile(registered):
             return registered
@@ -1205,7 +1429,10 @@ def _launch_concurrency_warnings(session_id, cwd, agent_dir):
     warnings = []
     prior = None
     for entry in _read_registry():
-        if entry.get("session") == session_id and entry.get("status") != "running":
+        if entry.get("session") == session_id and entry.get("status") not in (
+            "running",
+            "pending-dispatch",
+        ):
             if prior is None or _entry_stamp(entry) >= _entry_stamp(prior):
                 prior = entry
         elif (
@@ -1606,6 +1833,11 @@ def _pi_launch_impl(
     }
     if require_sentinel:
         result["require_sentinel"] = require_sentinel
+    if not _record_pending_dispatch(session_id, cwd, "auto" if auto else "manual"):
+        warnings.append(
+            "preflight warn: could not record the pending-dispatch intent row; "
+            "wait cannot detect a never-dispatched command for this session"
+        )
     if auto:
         return _dispatch_command(command, cwd, session_id)
     if system_prompt is not None:
