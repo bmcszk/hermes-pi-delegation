@@ -33,6 +33,8 @@ import threading
 import time
 from collections.abc import Callable
 
+import registry_log
+
 # 120 s was too short: real sweep contracts were killed mid-run and reported
 # as "no changes". Override per call with --timeout, or via PI_WORKER_TIMEOUT_S.
 DEFAULT_TIMEOUT_S = float(os.environ.get("PI_WORKER_TIMEOUT_S", "900"))
@@ -102,31 +104,26 @@ def _registry_patch(session_id, pid, **fields):
     raises. True when a line changed, so the caller can retry a stamp that
     raced its row into existence."""
     try:
-        lines = []
-        changed = False
-        if os.path.exists(REGISTRY_PATH):
-            with open(REGISTRY_PATH) as f:
-                for line in f:
-                    try:
-                        data = json.loads(line)
-                    except Exception:
-                        lines.append(line)
+        with registry_log.locked_registry(REGISTRY_PATH):
+            rows, torn = registry_log.read_registry_lines(REGISTRY_PATH)
+            changed = False
+            lines = []
+            for data in rows:
+                if (
+                    data.get("session") == session_id
+                    and data.get("pid") == pid
+                    and data.get("status") == "running"
+                ):
+                    merged = dict(data)
+                    merged.update(fields)
+                    if merged != data:
+                        lines.append(json.dumps(merged) + "\n")
+                        changed = True
                         continue
-                    if (
-                        data.get("session") == session_id
-                        and data.get("pid") == pid
-                        and data.get("status") == "running"
-                    ):
-                        merged = dict(data)
-                        merged.update(fields)
-                        if merged != data:
-                            lines.append(json.dumps(merged) + "\n")
-                            changed = True
-                            continue
-                    lines.append(line)
-        if changed:
-            with open(REGISTRY_PATH, "w") as f:
-                f.writelines(lines)
+                lines.append(json.dumps(data) + "\n")
+            lines.extend(line + "\n" for line in torn)
+            if changed:
+                registry_log.write_registry_lines(REGISTRY_PATH, lines)
     except Exception:
         pass
 
@@ -194,6 +191,25 @@ def _write_deliverable(path, text):
         return False
 
 
+def _deliverable_verdict(path, sentinel):
+    """met / unmet / unchecked for one dispatch's deliverable file.
+
+    A call count cannot prove a deliverable: a coder session made 35 research
+    tool calls, changed nothing, and still exited satisfied. The sentinel line in
+    the require_edit file is the claim; this is the check. A missing file is
+    unmet, never met, and the sentinel matches literally (no regex).
+    """
+    if not sentinel:
+        return "unchecked"
+    if not path:
+        return "unmet"
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return "met" if sentinel in handle.read() else "unmet"
+    except OSError:
+        return "unmet"
+
+
 def _lane_lock_path(session_id):
     """Hold-point for one dispatch: <cwd>/.hermes/lane/LOCK/<session>.lock.
 
@@ -251,7 +267,9 @@ def _content_contains(path, needle):
         return False
 
 
-def _registry_write(session_id, model, status, pid=None, exit_code=None):
+def _registry_write(
+    session_id, model, status, pid=None, exit_code=None, deliverable=None, require_sentinel=None
+):
     """Append/update the agent registry line. Never raises, never blocks dispatch."""
     try:
         import datetime
@@ -267,13 +285,15 @@ def _registry_write(session_id, model, status, pid=None, exit_code=None):
         }
         if exit_code is not None:
             entry["exit_code"] = int(exit_code)
+        if deliverable is not None:
+            entry["deliverable"] = deliverable
+        if require_sentinel:
+            entry["require_sentinel"] = require_sentinel
         if status in ("done", "error", "killed", "timeout"):
             entry["finished"] = now
             _registry_update_running(session_id, entry)
         else:
-            os.makedirs(os.path.dirname(REGISTRY_PATH), exist_ok=True)
-            with open(REGISTRY_PATH, "a") as f:
-                f.write(json.dumps(entry) + "\n")
+            registry_log.append_registry_line(REGISTRY_PATH, json.dumps(entry))
     except Exception:
         pass
 
@@ -288,32 +308,27 @@ def _registry_update_running(session_id, entry):
     (crash-before-write case).
     """
     try:
-        lines = []
-        replaced = False
-        exists = False
-        if os.path.exists(REGISTRY_PATH):
-            with open(REGISTRY_PATH) as f:
-                for line in f:
-                    try:
-                        data = json.loads(line)
-                    except Exception:
-                        lines.append(line)
+        with registry_log.locked_registry(REGISTRY_PATH):
+            rows, torn = registry_log.read_registry_lines(REGISTRY_PATH)
+            replaced = False
+            exists = False
+            lines = []
+            for data in rows:
+                if data.get("session") == session_id and data.get("pid") == entry["pid"]:
+                    exists = True
+                    if not replaced and data.get("status") == "running":
+                        merged = dict(data)
+                        merged.update(entry)
+                        lines.append(json.dumps(merged) + "\n")
+                        replaced = True
                         continue
-                    if data.get("session") == session_id and data.get("pid") == entry["pid"]:
-                        exists = True
-                        if not replaced and data.get("status") == "running":
-                            merged = dict(data)
-                            merged.update(entry)
-                            lines.append(json.dumps(merged) + "\n")
-                            replaced = True
-                            continue
-                    lines.append(line)
-        if exists and not replaced:
-            return
-        if not replaced:
-            lines.append(json.dumps(entry) + "\n")
-        with open(REGISTRY_PATH, "w") as f:
-            f.writelines(lines)
+                lines.append(json.dumps(data) + "\n")
+            lines.extend(line + "\n" for line in torn)
+            if exists and not replaced:
+                return
+            if not replaced:
+                lines.append(json.dumps(entry) + "\n")
+            registry_log.write_registry_lines(REGISTRY_PATH, lines)
     except Exception:
         pass
 
@@ -879,6 +894,15 @@ def main(argv: list[str] | None = None) -> int:
         help="tool calls required before the run counts as work (default 1)",
     )
     parser.add_argument(
+        "--require-sentinel",
+        default=None,
+        dest="require_sentinel",
+        help=(
+            "string that must appear in the require_edit file at exit; the client records "
+            "deliverable: met|unmet|unchecked on the registry row"
+        ),
+    )
+    parser.add_argument(
         "--auditor-deliverable",
         action="store_true",
         default=False,
@@ -919,6 +943,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     deliverable_paths = [p.strip() for p in (args.require_edit or "").split(",") if p.strip()]
     is_auditor = bool(args.auditor_deliverable)
+    sentinel_path = deliverable_paths[0] if deliverable_paths else None
     stale_steer = _steer_file(args.session_id)
     if stale_steer:
         # a fresh dispatch must not inherit a steer message aimed at a dead run
@@ -974,7 +999,14 @@ def main(argv: list[str] | None = None) -> int:
         exit_code = _killed_exit_code(exc)
         raise
     finally:
-        _registry_write(args.session_id or "unnamed", args.model, status, exit_code=exit_code)
+        _registry_write(
+            args.session_id or "unnamed",
+            args.model,
+            status,
+            exit_code=exit_code,
+            deliverable=_deliverable_verdict(sentinel_path, args.require_sentinel),
+            require_sentinel=args.require_sentinel,
+        )
         client.close()
         _lane_lock_release(args.session_id or "unnamed", args.cwd)
     return 0 if status == "done" else 3

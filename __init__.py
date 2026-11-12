@@ -11,6 +11,8 @@ import subprocess
 import sys
 import time
 
+import registry_log
+
 # Constants
 REGISTRY_PATH = os.path.expanduser("~/.hermes/logs/pi-agents.jsonl")
 CLIENT_PATH = os.path.join(os.path.dirname(__file__), "scripts", "pi_rpc_client.py")
@@ -57,49 +59,71 @@ TOOLSETS = {
 # Prompt budget handed to the worker. The client default (120 s) is far too
 # short for a real sweep: workers were being killed mid-contract.
 WORKER_TIMEOUT_S = int(os.environ.get("PI_WORKER_TIMEOUT_S", "900"))
+# wait clamps its own budget below the host's 1600 s tool-call ceiling: a wait
+# that rides that limit loses the whole turn instead of answering.
+WAIT_CEILING_S = 1500
 _UNSET = object()  # distinguishes "caller passed it" from the signature default
+
+# why the last registry read skipped a line; the next read resets it
+_last_registry_warning = None
 
 
 def _read_registry():
-    """Return list of parsed registry entries. Best-effort, never raises."""
-    entries = []
+    """Return list of parsed registry entries. Best-effort, never raises.
+
+    A torn line (a write that landed in halves, or a trailing write caught
+    mid-append) is skipped with a warning instead of hiding every other row:
+    one bad line must never cost the whole registry.
+    """
+    global _last_registry_warning
+    _last_registry_warning = None
     try:
-        if not os.path.exists(REGISTRY_PATH):
-            return entries
-        with open(REGISTRY_PATH) as f:
-            for line in f:
-                try:
-                    entries.append(json.loads(line))
-                except Exception:
-                    continue
-    except Exception:
-        pass
+        entries, torn = registry_log.read_registry(REGISTRY_PATH)
+    except Exception as exc:  # a missing or unreadable file answers an empty list
+        _last_registry_warning = f"registry unreadable: {exc}"
+        return []
+    if torn:
+        _last_registry_warning = (
+            f"skipped {len(torn)} torn line(s) in {REGISTRY_PATH}; "
+            f"run pi_manage(action='doctor') or _registry_repair() to quarantine them"
+        )
+        logging.warning(_last_registry_warning)
     return entries
+
+
+def _registry_repair(path=None):
+    """Quarantine torn registry lines into <registry>.corrupt and rewrite clean.
+
+    The rewrite is atomic, so a reader never sees the intermediate file. Lines
+    that do not parse are preserved verbatim in the .corrupt file: they are the
+    only record of whatever tore them.
+    """
+    path = path or REGISTRY_PATH
+    with registry_log.locked_registry(path):
+        rows, torn = registry_log.read_registry_lines(path)
+        corrupt_path = f"{path}.corrupt"
+        if torn:
+            with open(corrupt_path, "a") as corrupt:
+                corrupt.writelines(line + "\n" for line in torn)
+            registry_log.write_registry_lines(path, [json.dumps(row) + "\n" for row in rows])
+    return {"kept": len(rows), "quarantined": len(torn), "corrupt_path": corrupt_path}
 
 
 def _registry_update(session_id, pid, **fields):
     """Read-modify-write the registry line matching session+pid. Best-effort."""
     try:
-        if not os.path.exists(REGISTRY_PATH):
-            return
-        lines = []
-        changed = False
-        with open(REGISTRY_PATH) as f:
-            for line in f:
-                try:
-                    data = json.loads(line)
-                except Exception:
-                    lines.append(line)
-                    continue
+        with registry_log.locked_registry(REGISTRY_PATH):
+            rows, torn = registry_log.read_registry_lines(REGISTRY_PATH)
+            changed = False
+            lines = []
+            for data in rows:
                 if data.get("session") == session_id and data.get("pid") == pid:
                     data.update(fields)
-                    lines.append(json.dumps(data) + "\n")
                     changed = True
-                else:
-                    lines.append(line)
-        if changed:
-            with open(REGISTRY_PATH, "w") as f:
-                f.writelines(lines)
+                lines.append(json.dumps(data) + "\n")
+            lines.extend(line + "\n" for line in torn)
+            if changed:
+                registry_log.write_registry_lines(REGISTRY_PATH, lines)
     except Exception:
         pass
 
@@ -325,6 +349,15 @@ LAUNCH_PARAMS = {
         "minimum": 0,
         "description": "corrective prompts before giving up; needs require_edit",
     },
+    "require_sentinel": {
+        "type": "string",
+        "description": (
+            "optional string that must appear in the require_edit file at exit; the "
+            "registry row then records deliverable: met|unmet|unchecked (exit code "
+            "unchanged) and wait/list surface it. Needs require_edit. Closes the "
+            "satisfied-by-call-count hole: tool calls cannot prove a deliverable"
+        ),
+    },
     "timeout_s": {
         "type": "integer",
         "minimum": 30,
@@ -447,12 +480,24 @@ def register(ctx):
                 "timeout_s": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "wait: seconds to keep probing; 0 means a single probe",
+                    "description": (
+                        "wait: seconds to keep probing; 0 means a single probe. "
+                        "Clamped to 1500s (WAIT_CEILING_S), safely under the host's "
+                        "1600s tool-call ceiling; a clamped answer carries "
+                        "clamped/resumed_by=call-wait-again"
+                    ),
                 },
                 "poll_s": {
                     "type": "integer",
                     "minimum": 1,
                     "description": "wait: seconds between probes",
+                },
+                "go_tests": {
+                    "type": "boolean",
+                    "description": (
+                        "salvage_report: for a recorded cwd with go.mod, also run "
+                        "'go test ./...' (off by default: it dominates the report's runtime)"
+                    ),
                 },
             },
             ["action"],
@@ -523,6 +568,7 @@ def _pi_manage_impl(
     poll_s=None,
     message=None,
     queue=False,
+    go_tests=False,
     **_,
 ):
     if action == "steer":
@@ -530,15 +576,22 @@ def _pi_manage_impl(
     if action == "wait":
         if not session_id:
             return {"error": "session_id required for wait"}
-        budget = max(0, int(timeout_s or 0))
+        requested = max(0, int(timeout_s or 0))
+        budget = min(requested, WAIT_CEILING_S)
         poll = max(1, int(poll_s or 1))
-        return _wait_for_completion(session_id, budget, poll)
+        result = _wait_for_completion(session_id, budget, poll)
+        result["requested_timeout_s"] = requested
+        result["timeout_s"] = budget
+        result["clamped"] = budget < requested
+        if result["clamped"] and not result["finished"]:
+            result["resumed_by"] = "call-wait-again"
+        return result
     if action == "doctor":
         return _doctor()
     if action == "logs":
         return _session_logs(session_id, lines)
     if action == "salvage_report":
-        return _salvage_report(session_id, lines)
+        return _salvage_report(session_id, lines, go_tests)
 
     if action == "list":
         agents = _read_registry()
@@ -613,6 +666,8 @@ def _wait_result(session_id, entry):
             result["last_activity_s"] = age
     if entry.get("exit_code") is not None:
         result["exit_code"] = entry["exit_code"]
+    if entry.get("deliverable") is not None:
+        result["deliverable"] = entry["deliverable"]
     return result
 
 
@@ -638,7 +693,6 @@ def _wait_for_completion(session_id, budget, poll):
 
 
 def _git_readonly(cwd, *args):
-    """Run a read-only git command in cwd. Returns (ok, stdout)."""
     try:
         proc = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=30)
         return proc.returncode == 0, (proc.stdout if proc.returncode == 0 else proc.stderr)
@@ -648,6 +702,65 @@ def _git_readonly(cwd, *args):
 
 def _base_is_valid(cwd, base):
     return bool(base) and bool(_git_readonly(cwd, "cat-file", "-e", f"{base}^{{commit}}")[0])
+
+
+# Quick gates per project type, chosen from the RECORDED cwd's root markers. A
+# worker in another repo must never be graded by the plugin's own checks: one
+# live Go session surfaced 23 pre-existing lint errors from this tree.
+PROJECT_MARKERS = (
+    ("go.mod", "go"),
+    ("pyproject.toml", "python"),
+    ("plugin.yaml", "plugin"),
+)
+
+
+def _project_type(cwd):
+    """Project type of the recorded cwd: go, python, plugin, or unknown."""
+    if not cwd:
+        return "unknown"
+    for marker, kind in PROJECT_MARKERS:
+        if os.path.isfile(os.path.join(cwd, marker)):
+            return kind
+    return "unknown"
+
+
+def _gate_commands(project_type, go_tests):
+    """(name, command) pairs for one project type; go test stays opt-in."""
+    if project_type == "go":
+        gates = [
+            (
+                "gofmt",
+                "unformatted=$(gofmt -l .) || exit 1; "
+                '[ -z "$unformatted" ] || { echo "$unformatted"; exit 1; }',
+            ),
+            ("go-build", "go build ./..."),
+        ]
+        if go_tests:
+            gates.append(("go-test", "go test ./..."))
+        return gates
+    if project_type == "python":
+        return [("ruff-check", "uvx ruff check ."), ("compileall", "python -m compileall -q .")]
+    if project_type == "plugin":
+        return [
+            ("uvx-ruff-check", "uvx ruff check ."),
+            ("compileall-plugin", "python -m compileall -q __init__.py scripts tests"),
+        ]
+    return []
+
+
+def _project_gates(cwd, go_tests=False):
+    """Gate rows for the recorded cwd's project type, plus a named skip when
+    the type cannot be established, so an empty gate list never reads as pass."""
+    project_type = _project_type(cwd)
+    commands = _gate_commands(project_type, go_tests)
+    if not commands:
+        reason = (
+            "no recorded cwd for this row"
+            if not cwd
+            else f"no project marker (go.mod, pyproject.toml, plugin.yaml) in {cwd}"
+        )
+        return [{"name": "project-type", "command": "", "ok": False, "skipped": reason}]
+    return [_gate_row(name, command, cwd) for name, command in commands]
 
 
 def _gate_row(name, command, cwd):
@@ -672,7 +785,7 @@ def _gate_row(name, command, cwd):
         }
 
 
-def _salvage_report(session_id, lines=12):
+def _salvage_report(session_id, lines=12, go_tests=False):
     """Post-exit state collection for one session, in one call, shaped to
     paste as the on-disk state section of a continuation contract. Read-only,
     best-effort: every leg degrades to a named skip instead of raising.
@@ -740,12 +853,8 @@ def _salvage_report(session_id, lines=12):
             if k in frames
         },
         "lane_lock": lane_lock_row,
-        "gates": [
-            _gate_row("uvx-ruff-check", "uvx ruff check .", cwd),
-            _gate_row(
-                "compileall-plugin", "python -m compileall -q __init__.py scripts tests", cwd
-            ),
-        ],
+        "project_type": _project_type(cwd),
+        "gates": _project_gates(cwd, go_tests),
     }
 
 
@@ -972,6 +1081,7 @@ def _preflight(
     model=None,
     epic_id=None,
     task_slug=None,
+    require_sentinel=None,
 ):
     """Fail-fast contract, budget, model and naming checks before a worker spawns.
 
@@ -1045,6 +1155,11 @@ def _preflight(
         failures.append(
             "budgets - min_tool_calls/max_nudges set without require_edit: the gate has no aim"
         )
+    if require_sentinel and not require_edit:
+        failures.append(
+            "require_sentinel - set without require_edit: the sentinel check has no file to "
+            "grep; name the deliverable file in require_edit"
+        )
 
     if not (
         os.path.isfile(os.path.join(cwd, ".beans.yml"))
@@ -1072,6 +1187,7 @@ def _pi_launch_impl(
     max_nudges=_UNSET,
     timeout_s=None,
     wall_timeout_s=None,
+    require_sentinel=None,
     create_anchor=False,
     auto=False,
     **_,
@@ -1153,6 +1269,7 @@ def _pi_launch_impl(
         model,
         epic_id,
         task_slug,
+        require_sentinel,
     )
     failures += preflight_skill_failures
     if failures:
@@ -1241,6 +1358,8 @@ def _pi_launch_impl(
         parts.extend(["--require-edit", targets])
         parts.extend(["--min-tool-calls", str(min_calls)])
         parts.extend(["--max-nudges", str(max_nudges_resolved)])
+        if require_sentinel:
+            parts.extend(["--require-sentinel", require_sentinel])
     else:
         # preflight already refuses min/max without require_edit
         nudge_clause = "nudge: 0 - no correction loop"
@@ -1250,6 +1369,8 @@ def _pi_launch_impl(
     budget_note = (
         f"budget: per-call <= {resolved_timeout}s, wall <= {resolved_wall}s, {nudge_clause}"
     )
+    if require_sentinel:
+        budget_note += f", deliverable: sentinel {require_sentinel!r}"
     command += f"echo {shlex.quote(budget_note)} && "
     command += " ".join(shlex.quote(p) for p in parts[:-1])
     # Last part keeps $(cat ...) unquoted at the outer level: shlex.quote would
@@ -1262,6 +1383,8 @@ def _pi_launch_impl(
         "worker_type": worker_type,
         "mode": mode,
     }
+    if require_sentinel:
+        result["require_sentinel"] = require_sentinel
     if auto:
         return _dispatch_command(command, cwd, session_id)
     if system_prompt is not None:

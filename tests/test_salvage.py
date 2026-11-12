@@ -85,11 +85,13 @@ def test_salvage_report_collects_one_call(tmp_path):
         assert result["git"]["branch_head"], result["git"]
         assert result["frames"]["path"] == str(transcript), result
         assert result["frames"]["tool_calls"] == 1, result["frames"]
+        # gates follow the RECORDED cwd's project type: this row's repo has no
+        # project marker, so the report names the skip instead of borrowing the
+        # plugin repo's checks
         gates = {row["name"]: row for row in result["gates"]}
-        assert set(gates) == {"uvx-ruff-check", "compileall-plugin"}, gates
-        for row in result["gates"]:
-            assert row["ok"] in (True, False), row
-            assert row["command"], row
+        assert result["project_type"] == "unknown", result
+        assert set(gates) == {"project-type"}, gates
+        assert gates["project-type"]["skipped"], gates
     finally:
         _teardown_registry()
 
@@ -296,6 +298,9 @@ def test_salvage_gates_run_in_recorded_cwd(tmp_path, monkeypatch):
     pathlib.Path(repo).mkdir()
     with open(os.path.join(repo, "AGENTS.md"), "w") as f:
         f.write("m\n")
+    # a pyproject marker selects the python quick gates for this repo
+    with open(os.path.join(repo, "pyproject.toml"), "w") as f:
+        f.write("[project]\nname = 'worker'\n")
     # the tmp repo FAILS the compileall gate deterministically: broken syntax
     with open(os.path.join(repo, "__init__.py"), "w") as f:
         f.write("def broken(:\n")
@@ -305,7 +310,7 @@ def test_salvage_gates_run_in_recorded_cwd(tmp_path, monkeypatch):
     try:
         result = _parse(p._pi_manage_impl("salvage_report", session_id="epicRev-coder"))
         assert "error" not in result, result
-        compile_row = next(r for r in result["gates"] if r["name"] == "compileall-plugin")
+        compile_row = next(r for r in result["gates"] if r["name"] == "compileall")
         assert compile_row["ok"] is False, compile_row
         assert "broken" in compile_row["output_tail"], compile_row
     finally:
