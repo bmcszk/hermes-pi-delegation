@@ -101,6 +101,21 @@ the session is still settling — waiting again is safe, the loop is stateless.
 A budget at or under 1500 s comes back unclamped (`clamped: false`, no hint).
 
 
+### `verify`: one call for the whole exit drill
+
+Exit codes lie in both directions: a run can finish ALL the work and still
+exit 3 with `satisfied=False`, while another exits 0 with the sentinel written
+but the tree dirty. `pi_manage(action="verify", session_id=...)` answers with
+`exit_code`, `uncommitted_files`, `commits_since_base`, `unpushed_commits`, the
+re-checked `deliverable`, and a single top-level `ok` verdict that judges the
+tree rather than the client's claim — exit 3 over a committed, clean, pushed
+tree answers `ok: true` with the contradiction named; exit 0 with residue
+answers `ok: false` naming it. Every leg degrades to a named skip (no upstream,
+no base, non-git cwd), never an error. It is read-only and distinct from
+`salvage_report`: that one is the fast post-exit state dump with per-project
+gates and no remote comparison; `verify` adds the upstream comparison and one
+verdict.
+
 ### `salvage_report` quick gates follow the recorded cwd
 
 `salvage_report` answers with the post-exit state of one dispatch; its `gates`

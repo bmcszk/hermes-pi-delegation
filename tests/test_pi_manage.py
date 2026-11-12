@@ -312,6 +312,96 @@ def test_pi_manage_kill_verifies_the_pid_before_signalling(decoy_cmd, expect_err
         _cleanup_registry(tmpdir)
 
 
+def test_verify_verdict_combines_exit_code_tree_and_deliverable():
+    """pi_manage verify: one call, five legs plus a top-level ok verdict.
+
+    Exit 3 with a clean, fully pushed tree names the contradiction and still
+    answers ok; exit 0 with residue answers not-ok naming it.
+    """
+    tmpdir = tempfile.mkdtemp()
+    _registry(tmpdir)
+    repo = _git_repo(tmpdir)
+    subprocess.run(
+        ["git", "-C", repo, "remote", "add", "origin", repo], capture_output=True
+    )
+    subprocess.run(["git", "-C", repo, "push", "-q", "-u", "origin", "HEAD"], capture_output=True)
+    deliverable = os.path.join(tempfile.mkdtemp(prefix="verify-deliverable-"), "log.md")
+    base = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+    with open(deliverable, "w") as f:
+        f.write("header\nDONE-MARK\n")
+    try:
+        _write_registry(
+            {
+                "session": "epicVerify-coder",
+                "pid": 999999,
+                "status": "incomplete",
+                "exit_code": 3,
+                "cwd": repo,
+                "base": base,
+                "require_sentinel": "DONE-MARK",
+                "require_edit": deliverable,
+                "deliverable": "unmet",
+                "started": "2024-01-01T00:00:00",
+            }
+        )
+        verdict = _parse(pi_manage({"action": "verify", "session_id": "epicVerify-coder"}))
+        assert verdict["exit_code"] == 3, verdict
+        assert verdict["uncommitted_files"] == 0, verdict
+        assert verdict["commits_since_base"] == 0, verdict
+        assert verdict["unpushed_commits"] == 0, verdict
+        assert verdict["deliverable"] == "met", verdict
+        assert verdict["ok"] is True, verdict
+
+        # exit 0 but the tree is dirty: not ok, and the answer names the residue
+        with open(os.path.join(repo, "new.txt"), "w") as f:
+            f.write("residue\n")
+        _write_registry(
+            {
+                "session": "epicVerify2-coder",
+                "pid": 999999,
+                "status": "done",
+                "exit_code": 0,
+                "cwd": repo,
+                "base": base,
+                "started": "2024-01-02T00:00:00",
+            }
+        )
+        verdict = _parse(pi_manage({"action": "verify", "session_id": "epicVerify2-coder"}))
+        assert verdict["ok"] is False, verdict
+        assert verdict["uncommitted_files"] == 1, verdict
+        assert "uncommitted" in json.dumps(verdict), verdict
+    finally:
+        _cleanup_registry(tmpdir)
+
+
+def test_verify_degrades_each_leg_without_raising():
+    """No upstream: unpushed leg carries a named skip and ok still answers.
+    Unknown session id returns the same unknown shape as wait."""
+    tmpdir = tempfile.mkdtemp()
+    _registry(tmpdir)
+    repo = _git_repo(tmpdir)
+    try:
+        _write_registry(
+            {
+                "session": "epicVerify3-coder",
+                "pid": 999999,
+                "status": "done",
+                "exit_code": 0,
+                "cwd": repo,
+                "started": "2024-01-01T00:00:00",
+            }
+        )
+        verdict = _parse(pi_manage({"action": "verify", "session_id": "epicVerify3-coder"}))
+        assert "skipped" in str(verdict["unpushed_commits"]), verdict
+        assert verdict["ok"] is True, verdict
+        ghost = _parse(pi_manage({"action": "verify", "session_id": "epicGhost-coder"}))
+        assert ghost["finished"] is False and ghost["status"] == "unknown", ghost
+    finally:
+        _cleanup_registry(tmpdir)
+
+
 def test_handlers_match_framework_contract():
     """Framework calls handler(args: dict) with ONE positional dict; both
     wrappers return JSON strings."""

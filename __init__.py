@@ -466,6 +466,7 @@ def register(ctx):
                         "wait",
                         "steer",
                         "salvage_report",
+                        "verify",
                     ],
                 },
                 "session_id": {"type": "string"},
@@ -591,6 +592,8 @@ def _pi_manage_impl(
         if result["clamped"] and not result["finished"]:
             result["resumed_by"] = "call-wait-again"
         return result
+    if action == "verify":
+        return _verify_session(session_id)
     if action == "doctor":
         return _doctor()
     if action == "logs":
@@ -891,6 +894,84 @@ def _salvage_report(session_id, lines=12, go_tests=False):
         "project_type": _project_type(cwd),
         "gates": _project_gates(cwd, go_tests),
     }
+
+
+def _verify_session(session_id):
+    """One-call, read-only exit drill for a recorded session: the registry's
+    exit facts plus the tree facts that override them, combined into a single
+    ok verdict. Exit codes lie in both directions - exit 3 with a fully
+    committed and pushed tree is a completed run, exit 0 with uncommitted
+    residue is not - so the verdict judges the tree, and names whichever
+    contradiction it found. Every leg degrades to a named skip, never raises.
+    Distinct from salvage_report: that one is the fast post-exit state dump
+    with per-project gates; verify adds the upstream comparison and one verdict.
+    """
+    entry = _newest_registry_entry(session_id)
+    if entry is None:
+        return {"finished": False, "status": "unknown"}
+    cwd = entry.get("cwd")
+    tree = _tree_summary(cwd, entry.get("base"))
+    uncommitted = tree["dirty"] if isinstance(tree["dirty"], int) else None
+    verdict = _deliverable_verdict_for_row(entry, cwd)
+    result = {
+        "session": session_id,
+        "finished": _wait_finished(entry),
+        "status": entry.get("status") or "running",
+        "exit_code": entry.get("exit_code"),
+        "uncommitted_files": uncommitted,
+        "commits_since_base": tree["commits_since_base"],
+        "unpushed_commits": tree["unpushed"],
+        "tree": tree,
+        "deliverable": verdict,
+    }
+    result["ok"], result["note"] = _verify_verdict(result, tree)
+    return result
+
+
+def _deliverable_verdict_for_row(entry, cwd):
+    """Re-check the row's sentinel against its deliverable file, or pass the
+    recorded verdict through when the row never armed a sentinel. A relative
+    require_edit path resolves against the row's recorded cwd."""
+    sentinel = entry.get("require_sentinel")
+    if not sentinel:
+        return entry.get("deliverable") or "unchecked"
+    path = entry.get("require_edit")
+    if isinstance(path, list):
+        path = path[0] if path else None
+    import pi_rpc_client
+
+    if path and not os.path.isabs(path):
+        path = os.path.join(cwd or ".", path)
+    return pi_rpc_client._deliverable_verdict(path, sentinel)
+
+
+def _verify_verdict(result, tree):
+    """(ok, note) from the verify legs: tree clean, nothing unpushed, and
+    either client-satisfied or the done-anyway contradiction named."""
+    residue = [
+        name
+        for name in ("dirty", "commits_since_base", "unpushed")
+        if isinstance(tree.get(name), dict)
+    ]
+    note_parts = []
+    if result["uncommitted_files"]:
+        note_parts.append(
+            f"exit {result['exit_code']} but "
+            f"{result['uncommitted_files']} uncommitted file(s) remain"
+        )
+    if isinstance(tree.get("unpushed"), int) and tree["unpushed"]:
+        note_parts.append(f"{tree['unpushed']} unpushed commit(s)")
+    exit_zero_unmet = result["exit_code"] == 0 and result["deliverable"] == "unmet"
+    if exit_zero_unmet:
+        note_parts.append("exit 0 but the sentinel is absent from the deliverable")
+    if note_parts:
+        return False, "; ".join(note_parts)
+    if result["exit_code"] not in (0, None) and not residue:
+        return True, (
+            f"exit {result['exit_code']} yet the tree is committed, clean and pushed: "
+            "the work is done despite the client's own verdict"
+        )
+    return True, ""
 
 
 def _dispatch_command(command, cwd, session_id):
