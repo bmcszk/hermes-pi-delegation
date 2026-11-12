@@ -439,3 +439,35 @@ def test_readme_exit_code_table_covers_the_codes():
     assert "| 143 | SIGTERM (external kill; kill action stamps 143 itself) |" in readme
     assert "| 0 | done: dispatch satisfied |" in readme
     assert "| 130 | KeyboardInterrupt (Ctrl-C) |" in readme
+
+
+@pytest.mark.parametrize(
+    ("worker_type", "with_require_edit", "expect_warn"),
+    [
+        pytest.param("coder", False, True, id="coder-ungated-warns"),
+        pytest.param("coder", True, False, id="coder-gated-no-warning"),
+        pytest.param("reasoner", False, False, id="reasoner-no-warning"),
+        pytest.param("brainer", False, False, id="brainer-no-warning"),
+        pytest.param("default", False, False, id="default-no-warning"),
+    ],
+)
+def test_preflight_warns_coder_without_require_edit(worker_type, with_require_edit, expect_warn):
+    """An ungated coder dispatch stays legal but draws the exit-0-no-edits
+    warning; every other worker type stays silent."""
+    proj = _marked_project()
+    payload = {
+        "worker_type": worker_type,
+        "model": "m",
+        "skills": [],
+        "contract_path": os.path.join(proj, "contract.md"),
+        "cwd": proj,
+        "epic_id": f"epicWarn-{worker_type}",
+    }
+    if with_require_edit:
+        payload["require_edit"] = os.path.join(proj, "a.go")
+    result = _launch(payload)
+    assert "error" not in result, result
+    warnings = json.dumps(result.get("warnings", []))
+    assert ("exit 0" in warnings and "require_edit" in warnings) is expect_warn, result.get(
+        "warnings"
+    )

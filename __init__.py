@@ -1260,6 +1260,12 @@ def _preflight(
             "auditor - mode aims at no deliverable: require_edit names the file the "
             "final text is written into"
         )
+    if worker_type == "coder" and not require_edit:
+        warnings.append(
+            "preflight warn: coder without require_edit - a worker that ends its turn "
+            "early yields exit 0 with zero edits and no gate catches it; pass require_edit "
+            "to arm the nudge gate"
+        )
     min_calls = 0 if min_tool_calls is _UNSET else int(min_tool_calls or 0)
     max_nudges = 0 if max_nudges is _UNSET else int(max_nudges or 0)
     if max_nudges > 0 and min_calls < 1:
