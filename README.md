@@ -110,6 +110,19 @@ session itself is untouched. `resumed_by: call-wait-again` appears only while
 the session is still settling — waiting again is safe, the loop is stateless.
 A budget at or under 1500 s comes back unclamped (`clamped: false`, no hint).
 
+#### Fail-fast: never-dispatched and unregistered workers
+
+Every launch records a `pending-dispatch` intent row (mode manual or auto) in
+the registry; the auto dispatch stamps the spawned pid onto it. If a wait sees
+a pending row older than 25 s, it classifies immediately instead of burning
+its budget: with no client process for the session it answers
+`status: never-dispatched` (run the returned command, or launch with
+`auto=true`; `pi_manage(action='kill', ...)` clears the pending row); with a
+live client process that never registered it answers
+`status: unregistered-client`; with neither row nor process it answers
+`status: unknown` at once. A session id that matches no launch record and no
+process never costs more than one probe.
+
 
 ### `verify`: one call for the whole exit drill
 
