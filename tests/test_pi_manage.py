@@ -25,6 +25,113 @@ import __init__ as p
 from __init__ import pi_launch, pi_manage
 
 
+def _git_repo(tmpdir):
+    """Fresh git repo with one commit, as a worker cwd fixture."""
+    repo = os.path.join(str(tmpdir), "repo")
+    os.makedirs(repo, exist_ok=True)
+    for args in (
+        ["init", "-q"],
+        ["config", "user.email", "t@t"],
+        ["config", "user.name", "t"],
+    ):
+        subprocess.run(["git", "-C", repo, *args], check=True, capture_output=True)
+    with open(os.path.join(repo, "f.txt"), "w") as f:
+        f.write("one\n")
+    subprocess.run(["git", "-C", repo, "add", "."], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", repo, "commit", "-q", "-m", "base"], check=True, capture_output=True
+    )
+    return repo
+
+
+@pytest.mark.parametrize(
+    ("action", "extra"),
+    [
+        pytest.param("wait", {"session_id": "epicTree-coder"}, id="wait"),
+        pytest.param("list", {}, id="list"),
+    ],
+)
+def test_terminal_answers_carry_tree_facts(action, extra):
+    """A terminal row in a git cwd gets a read-only tree block (dirty count,
+    commits since base, unpushed) inside the same wait/list answer."""
+    tmpdir = tempfile.mkdtemp()
+    _registry(tmpdir)
+    repo = _git_repo(tmpdir)
+    with open(os.path.join(repo, "f.txt"), "a") as f:
+        f.write("two\n")
+    base = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+    try:
+        row = {
+            "session": "epicTree-coder",
+            "pid": 999999,
+            "status": "done",
+            "exit_code": 0,
+            "cwd": repo,
+            "base": base,
+            "started": "2024-01-01T00:00:00",
+        }
+        _write_registry(row)
+        result = _parse(pi_manage({"action": action, **extra}))
+        answer = (
+            result
+            if action == "wait"
+            else next(a for a in result["agents"] if a["session"] == "epicTree-coder")
+        )
+        tree = answer["tree"]
+        assert tree["dirty"] == 1, tree
+        assert tree["commits_since_base"] == 0, tree
+        assert tree["unpushed"] == {"skipped": "no upstream configured"}, tree
+    finally:
+        _cleanup_registry(tmpdir)
+
+
+def test_tree_summary_skips_non_git_cwd():
+    """A non-git cwd answers tree: {skipped: reason}, never an empty block."""
+    tmpdir = tempfile.mkdtemp()
+    _registry(tmpdir)
+    plain = os.path.join(str(tmpdir), "plain")
+    os.makedirs(plain)
+    try:
+        _write_registry(
+            {
+                "session": "epicNoGit-coder",
+                "pid": 999999,
+                "status": "done",
+                "cwd": plain,
+                "started": "2024-01-01T00:00:00",
+            }
+        )
+        result = _parse(pi_manage({"action": "wait", "session_id": "epicNoGit-coder"}))
+        assert "skipped" in result["tree"], result
+    finally:
+        _cleanup_registry(tmpdir)
+
+
+def test_tree_summary_bounded_on_dead_cwd():
+    """An unwritable/removed cwd degrades to a skipped row, not an exception."""
+    tmpdir = tempfile.mkdtemp()
+    _registry(tmpdir)
+    gone = os.path.join(str(tmpdir), "vanished")
+    os.makedirs(gone)
+    try:
+        _write_registry(
+            {
+                "session": "epicGone-coder",
+                "pid": 999999,
+                "status": "done",
+                "cwd": gone,
+                "started": "2024-01-01T00:00:00",
+            }
+        )
+        os.rmdir(gone)
+        result = _parse(pi_manage({"action": "wait", "session_id": "epicGone-coder"}))
+        assert "skipped" in result["tree"], result
+    finally:
+        _cleanup_registry(tmpdir)
+
+
 def _registry(tmpdir, *entries):
     tmpdir = str(tmpdir)
     _setup_registry(tmpdir)

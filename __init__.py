@@ -617,6 +617,8 @@ def _pi_manage_impl(
             lock = _lane_lock_info(agent.get("cwd"), agent.get("session"))
             if lock is not None:
                 agent["lane_lock"] = {"present": True, "stale": lock["stale"]}
+            if _wait_finished(agent):
+                agent["tree"] = _tree_summary(agent.get("cwd"), agent.get("base"))
         agents.sort(key=lambda e: e.get("started", ""), reverse=True)
         return {"agents": agents}
 
@@ -655,6 +657,32 @@ def _pi_manage_impl(
         return {"error": f"Session {session_id} not found in registry"}
 
 
+def _tree_summary(cwd, base):
+    """Read-only tree facts for one row's cwd: dirty count, commits since the
+    row's launch base, unpushed count. Budget-bounded and best-effort: any leg
+    that cannot be established degrades to a named skip instead of raising, so
+    an answer that cannot read the tree never reads as "clean"."""
+    if not cwd or not os.path.isdir(cwd) or not _git_readonly(cwd, "status")[0]:
+        return {"skipped": "no recorded cwd" if not cwd else f"cwd is not a git repo: {cwd}"}
+    tree = {}
+    ok, out = _git_readonly(cwd, "status", "--porcelain")
+    tree["dirty"] = len(out.splitlines()) if ok else {"skipped": out}
+    if _base_is_valid(cwd, base):
+        ok, out = _git_readonly(cwd, "rev-list", "--count", f"{base}..HEAD")
+        tree["commits_since_base"] = int(out) if ok else {"skipped": out}
+    else:
+        tree["commits_since_base"] = {
+            "skipped": "no base recorded for this row" if not base else "unknown revision"
+        }
+    ok_up, up_out = _git_readonly(cwd, "rev-parse", "--abbrev-ref", "@{upstream}")
+    if ok_up:
+        ok, out = _git_readonly(cwd, "rev-list", "--count", f"{up_out.strip()}..HEAD")
+        tree["unpushed"] = int(out) if ok else {"skipped": out}
+    else:
+        tree["unpushed"] = {"skipped": "no upstream configured"}
+    return tree
+
+
 def _wait_result(session_id, entry):
     """Derived wait answer for one registry row: running/terminal/last_activity_s.
 
@@ -673,6 +701,8 @@ def _wait_result(session_id, entry):
         result["exit_code"] = entry["exit_code"]
     if entry.get("deliverable") is not None:
         result["deliverable"] = entry["deliverable"]
+    if result["finished"]:
+        result["tree"] = _tree_summary(entry.get("cwd"), entry.get("base"))
     return result
 
 
