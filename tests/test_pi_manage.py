@@ -25,6 +25,24 @@ import __init__ as p
 from __init__ import pi_launch, pi_manage
 
 
+def _marked_project(dir_path=None, contract=True, anchor="a.go"):
+    proj = dir_path or tempfile.mkdtemp(prefix="pi-delegation-gates-")
+    os.makedirs(proj, exist_ok=True)
+    with open(os.path.join(proj, "AGENTS.md"), "w") as f:
+        f.write("test repo marker\n")
+    if contract:
+        with open(os.path.join(proj, "contract.md"), "w") as f:
+            f.write("worker contract\n")
+    if anchor:
+        with open(os.path.join(proj, anchor), "w") as f:
+            f.write("package main\n")
+    return proj
+
+
+def _launch(payload):
+    return _parse(pi_launch(payload))
+
+
 def _git_repo(tmpdir):
     """Fresh git repo with one commit, as a worker cwd fixture."""
     repo = os.path.join(str(tmpdir), "repo")
@@ -321,9 +339,7 @@ def test_verify_verdict_combines_exit_code_tree_and_deliverable():
     tmpdir = tempfile.mkdtemp()
     _registry(tmpdir)
     repo = _git_repo(tmpdir)
-    subprocess.run(
-        ["git", "-C", repo, "remote", "add", "origin", repo], capture_output=True
-    )
+    subprocess.run(["git", "-C", repo, "remote", "add", "origin", repo], capture_output=True)
     subprocess.run(["git", "-C", repo, "push", "-q", "-u", "origin", "HEAD"], capture_output=True)
     deliverable = os.path.join(tempfile.mkdtemp(prefix="verify-deliverable-"), "log.md")
     base = subprocess.run(
@@ -400,6 +416,86 @@ def test_verify_degrades_each_leg_without_raising():
         assert ghost["finished"] is False and ghost["status"] == "unknown", ghost
     finally:
         _cleanup_registry(tmpdir)
+
+
+@pytest.mark.parametrize(
+    ("action", "expect_recovery"),
+    [
+        pytest.param("wait", True, id="wait-terminal-non-done"),
+        pytest.param("kill", True, id="kill"),
+    ],
+)
+def test_pi_manage_recovery_pointer(action, expect_recovery):
+    """wait on terminal non-done (incomplete/timeout/killed) and kill's answer
+    carry a recovery pointer to salvage_report; wait on done does not."""
+    tmpdir = tempfile.mkdtemp()
+    _registry(tmpdir)
+    try:
+        # seed a terminal non-done row
+        _write_registry(
+            {
+                "session": "epicRec-coder",
+                "pid": 999999,
+                "status": "incomplete",
+                "exit_code": 3,
+                "cwd": TMP_CWD,
+                "started": "2024-01-01T00:00:00",
+            }
+        )
+        payload = {"action": action, "session_id": "epicRec-coder"}
+        if action == "wait":
+            payload["timeout_s"] = 0
+        result = _parse(p.pi_manage(payload))
+        if expect_recovery:
+            assert "recovery" in result, result
+            assert "salvage_report" in result["recovery"], result
+            assert "epicRec-coder" in result["recovery"], result
+        else:
+            assert "recovery" not in result, result
+
+        # wait on done does NOT carry recovery
+        _write_registry(
+            {
+                "session": "epicDone-coder",
+                "pid": 999999,
+                "status": "done",
+                "exit_code": 0,
+                "cwd": TMP_CWD,
+                "started": "2024-01-02T00:00:00",
+            }
+        )
+        result = _parse(
+            p.pi_manage({"action": "wait", "session_id": "epicDone-coder", "timeout_s": 0})
+        )
+        assert "recovery" not in result, result
+    finally:
+        _cleanup_registry(tmpdir)
+
+
+def test_pi_launch_next_pointer():
+    """pi_launch (auto=false and auto=true) payload carries next naming wait
+    with the launched session id."""
+    proj = _marked_project()
+    payload = {
+        "worker_type": "coder",
+        "model": "m",
+        "skills": [],
+        "contract_path": os.path.join(proj, "contract.md"),
+        "cwd": proj,
+        "epic_id": "epicNext",
+    }
+    result = _launch(payload)
+    assert "error" not in result, result
+    assert "next" in result, result
+    assert "wait" in result["next"], result
+    assert "epicNext-coder" in result["next"], result
+
+    # auto=true also carries next
+    payload["auto"] = True
+    result = _launch(payload)
+    assert "next" in result, result
+    assert "wait" in result["next"], result
+    assert "epicNext-coder" in result["next"], result
 
 
 def test_handlers_match_framework_contract():

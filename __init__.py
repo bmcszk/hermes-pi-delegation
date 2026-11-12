@@ -653,10 +653,14 @@ def _pi_manage_impl(
                 _registry_update(
                     session_id, pid, status="killed", exit_code=143, finished=_now_iso()
                 )
-                return {"status": f"SIGTERM sent to pgid {pid} ({session_id})"}
+                return {
+                    "status": f"SIGTERM sent to pgid {pid} ({session_id})",
+                    "recovery": f"pi_manage(action='salvage_report', session_id='{session_id}')",
+                }
         if seen_dead_pid is not None:
             return {
-                "status": f"session {session_id} already dead (pid {seen_dead_pid}, marked dead)"
+                "status": f"session {session_id} already dead (pid {seen_dead_pid}, marked dead)",
+                "recovery": f"pi_manage(action='salvage_report', session_id='{session_id}')",
             }
         return {"error": f"Session {session_id} not found in registry"}
 
@@ -707,6 +711,9 @@ def _wait_result(session_id, entry):
         result["deliverable"] = entry["deliverable"]
     if result["finished"]:
         result["tree"] = _tree_summary(entry.get("cwd"), entry.get("base"))
+        status = entry.get("status") or "running"
+        if status in ("incomplete", "timeout", "killed"):
+            result["recovery"] = f"pi_manage(action='salvage_report', session_id='{session_id}')"
     return result
 
 
@@ -1000,7 +1007,13 @@ def _dispatch_command(command, cwd, session_id):
             )
     except OSError as exc:
         return {"error": f"$dispatch failed to spawn: {exc}", "log": log_path}
-    return {"dispatched": True, "pid": proc.pid, "session_id": session_id, "log": log_path}
+    return {
+        "dispatched": True,
+        "pid": proc.pid,
+        "session_id": session_id,
+        "log": log_path,
+        "next": f"pi_manage(action='wait', session_id='{session_id}', timeout_s<=1500)",
+    }
 
 
 def _doctor():
@@ -1589,6 +1602,7 @@ def _pi_launch_impl(
         "session_id": session_id,
         "worker_type": worker_type,
         "mode": mode,
+        "next": f"pi_manage(action='wait', session_id='{session_id}', timeout_s<=1500)",
     }
     if require_sentinel:
         result["require_sentinel"] = require_sentinel
