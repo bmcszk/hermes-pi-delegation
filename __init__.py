@@ -1282,6 +1282,17 @@ def _preflight(
             "require_sentinel - set without require_edit: the sentinel check has no file to "
             "grep; name the deliverable file in require_edit"
         )
+    elif require_sentinel:
+        try:
+            with open(os.path.expanduser(contract_path), encoding="utf-8", errors="replace") as f:
+                contract_text = f.read()
+            if require_sentinel not in contract_text:
+                warnings.append(
+                    f"preflight warn: sentinel {require_sentinel!r} never appears in the "
+                    "contract; the worker has no instruction to write it"
+                )
+        except OSError:
+            pass  # the exists-check above already fails the launch for this file
 
     if not (
         os.path.isfile(os.path.join(cwd, ".beans.yml"))

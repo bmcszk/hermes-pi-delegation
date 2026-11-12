@@ -442,6 +442,41 @@ def test_readme_exit_code_table_covers_the_codes():
 
 
 @pytest.mark.parametrize(
+    ("contract_text", "expect_warn"),
+    [
+        pytest.param("do the work\nwrite DONE-MARK at the end\n", False, id="sentinel-present"),
+        pytest.param("do the work, nothing else\n", True, id="sentinel-absent"),
+    ],
+)
+def test_preflight_warns_sentinel_missing_from_contract(contract_text, expect_warn, tmp_path):
+    """require_sentinel absent from the contract text draws a warning (the
+    worker was never told to write it); present, or no sentinel, stays silent."""
+    proj = _marked_project(str(tmp_path))
+    contract = os.path.join(proj, "contract.md")
+    with open(contract, "w") as f:
+        f.write(contract_text)
+    payload = {
+        "worker_type": "coder",
+        "model": "m",
+        "skills": [],
+        "contract_path": contract,
+        "cwd": proj,
+        "epic_id": "epicSentinel",
+        "require_edit": os.path.join(proj, "a.go"),
+    }
+    result = _launch({**payload, "require_sentinel": "DONE-MARK"})
+    assert "error" not in result, result
+    warnings = json.dumps(result.get("warnings", []))
+    assert ("never appears in the contract" in warnings) is expect_warn, result.get("warnings")
+
+    # no require_sentinel: the check is skipped entirely
+    result = _launch(payload)
+    assert "error" not in result and "never appears in the contract" not in json.dumps(
+        result.get("warnings", [])
+    ), result
+
+
+@pytest.mark.parametrize(
     ("worker_type", "with_require_edit", "expect_warn"),
     [
         pytest.param("coder", False, True, id="coder-ungated-warns"),
