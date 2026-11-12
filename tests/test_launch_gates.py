@@ -543,6 +543,53 @@ def test_preflight_warns_on_session_reuse_and_same_cwd_concurrency(tmp_path):
         p.REGISTRY_PATH = backup
 
 
+def test_preflight_warns_on_stale_lane_locks(tmp_path):
+    """Launch into a crash-leftover cwd warns per stale lock (path, owning
+    session, exact rm command); a live lock never draws the stale message and
+    the launcher never removes anything."""
+    proj = _marked_project(str(tmp_path))
+    lock_dir = os.path.join(proj, ".hermes", "lane", "LOCK")
+    os.makedirs(lock_dir)
+    stale_path = os.path.join(lock_dir, "crashed-epic-coder.lock")
+    with open(stale_path, "w") as f:
+        json.dump({"session_id": "crashed-epic-coder", "pid": 999999}, f)
+    live_lock = os.path.join(lock_dir, "live-epic-coder.lock")
+    with open(live_lock, "w") as f:
+        json.dump({"session_id": "live-epic-coder", "pid": os.getpid()}, f)
+
+    result = _launch(
+        {
+            "worker_type": "coder",
+            "model": "m",
+            "skills": [],
+            "contract_path": os.path.join(proj, "contract.md"),
+            "cwd": proj,
+            "epic_id": "lockCheck",
+        }
+    )
+    assert "error" not in result, result
+    warnings = json.dumps(result.get("warnings", []))
+    assert "crashed-epic-coder.lock" in warnings, result.get("warnings")
+    assert f"rm {stale_path}" in warnings, result.get("warnings")
+    assert "live-epic-coder" not in warnings, result.get("warnings")
+    assert os.path.exists(stale_path) and os.path.exists(live_lock), "launcher removed a lock"
+
+    # no lock files: no warning, no error
+    os.remove(stale_path)
+    os.remove(live_lock)
+    result = _launch(
+        {
+            "worker_type": "coder",
+            "model": "m",
+            "skills": [],
+            "contract_path": os.path.join(proj, "contract.md"),
+            "cwd": proj,
+            "epic_id": "lockCheck2",
+        }
+    )
+    assert "error" not in result and "stale" not in json.dumps(result.get("warnings", [])), result
+
+
 def _write_registry_line(row):
     import __init__ as pmod
 

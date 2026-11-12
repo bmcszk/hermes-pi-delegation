@@ -1,3 +1,4 @@
+import glob
 import hashlib
 import importlib.util
 import inspect
@@ -1042,7 +1043,6 @@ def _transcript_for(session_id):
     its filename lacks the session slug), then the legacy slug glob for rows
     recorded before that fix.
     """
-    import glob
 
     entry = _newest_registry_entry(session_id)
     if entry is not None:
@@ -1210,6 +1210,29 @@ def _launch_concurrency_warnings(session_id, cwd):
             f"preflight warn: session {session_id} has prior finished runs (last status "
             f"{prior.get('status')!r} at {when}); pi will resume that session's context - "
             "pass epic_id/task_slug for a fresh id"
+        )
+    return warnings
+
+
+def _stale_lane_lock_warnings(cwd):
+    """Stale-lock visibility at launch: glob-scan <cwd>/.hermes/lane/LOCK for
+    locks whose payload pid is dead and name the path, owning session, and the
+    exact rm command (same wording salvage_report uses). The launch itself
+    removes nothing - removal stays a human decision."""
+    warnings = []
+    lock_dir = os.path.join(cwd, ".hermes", "lane", "LOCK")
+    try:
+        lock_files = sorted(glob.glob(os.path.join(lock_dir, "*.lock")))
+    except Exception:
+        return warnings
+    for path in lock_files:
+        info = _lane_lock_info(cwd, os.path.splitext(os.path.basename(path))[0])
+        if info is None or not info["stale"]:
+            continue
+        owner = info["payload"].get("session_id") or "unknown session"
+        warnings.append(
+            f"preflight warn: stale lane lock in this directory (crash leftover from "
+            f"{owner}): {path} - remove it with: rm {path}"
         )
     return warnings
 
@@ -1439,6 +1462,7 @@ def _pi_launch_impl(
     if failures:
         return {"error": "preflight: " + "; ".join(failures)}
     warnings = preflight_warnings + _launch_concurrency_warnings(session_id, cwd) + warnings
+    warnings += _stale_lane_lock_warnings(cwd)
 
     # Single-line POSIX command, shlex-quoted throughout. Double quotes around
     # $(cat ...) so command substitution happens at shell level.
