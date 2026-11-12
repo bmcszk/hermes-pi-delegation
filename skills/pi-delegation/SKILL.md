@@ -165,6 +165,7 @@ scripts dir before importing `registry_log`. Tests must do the same:
 
 ```python
 import sys, os
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + "/scripts")
 import registry_log
 ```

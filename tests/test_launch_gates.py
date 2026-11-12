@@ -527,9 +527,9 @@ def test_preflight_warns_on_session_reuse_and_same_cwd_concurrency(tmp_path):
         )
         result = _launch({**payload, "epic_id": "fresh-id"})
         assert "error" not in result, result
-        assert "one worker per project directory" in json.dumps(
-            result.get("warnings", [])
-        ), result.get("warnings")
+        assert "one worker per project directory" in json.dumps(result.get("warnings", [])), (
+            result.get("warnings")
+        )
 
         # fresh id on a quiet cwd: neither warning
         p.REGISTRY_PATH = str(tmp_path / "empty.jsonl")
@@ -596,8 +596,7 @@ def test_preflight_warns_on_same_agent_dir_concurrency(tmp_path, monkeypatch):
     # Mock deployment models so "m" is a known alias (avoids the
     # "not verifiable against the deployment list" warning which is
     # orthogonal to the agent-dir concurrency check).
-    monkeypatch.setattr(p, "_deployment_models",
-                        lambda d: (["m", "other-model"], "m", True))
+    monkeypatch.setattr(p, "_deployment_models", lambda d: (["m", "other-model"], "m", True))
     # Redirect the global REGISTRY_PATH to the temp path so
     # _read_registry() sees our seeded rows.
     reg_path = str(tmp_path / "pi-agents.jsonl")
