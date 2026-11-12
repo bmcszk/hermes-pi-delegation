@@ -18,8 +18,6 @@ import time
 import __init__ as p
 
 TMP_CWD = tempfile.mkdtemp(prefix="pi-delegation-test-cwd-")
-with open(os.path.join(TMP_CWD, "AGENTS.md"), "w") as _f:
-    _f.write("test repo marker\n")
 CONTRACT_MD = os.path.join(TMP_CWD, "contract.md")
 with open(CONTRACT_MD, "w") as _f:
     _f.write("test contract\n")
@@ -33,22 +31,8 @@ for _name in (CODING_RULES, GO_DEV):
     os.makedirs(_name, exist_ok=True)
     with open(os.path.join(_name, "SKILL.md"), "w") as _f:
         _f.write(f"---\nname: {os.path.basename(_name)}\n---\ntest\n")
-
 with open(os.path.join(TMP_CWD, "AGENTS.md"), "w") as _f:
     _f.write("test repo marker\n")
-CONTRACT_MD = os.path.join(TMP_CWD, "contract.md")
-with open(CONTRACT_MD, "w") as _f:
-    _f.write("test contract\n")
-
-_registry_backup = p.REGISTRY_PATH
-
-SKILLS = os.path.join(TMP_CWD, "skills")
-CODING_RULES = os.path.join(SKILLS, "coding-rules")
-GO_DEV = os.path.join(SKILLS, "go-dev")
-for _name in (CODING_RULES, GO_DEV):
-    os.makedirs(_name, exist_ok=True)
-    with open(os.path.join(_name, "SKILL.md"), "w") as _f:
-        _f.write(f"---\nname: {os.path.basename(_name)}\n---\ntest\n")
 
 
 def _parse(result):
@@ -59,7 +43,7 @@ def _parse(result):
 def _setup_registry(tmpdir):
     global _registry_backup
     _registry_backup = p.REGISTRY_PATH
-    p.REGISTRY_PATH = os.path.join(tmpdir, "pi-agents.jsonl")
+    p.REGISTRY_PATH = os.path.join(str(tmpdir), "pi-agents.jsonl")
 
 
 def _teardown_registry():
@@ -80,6 +64,7 @@ exec sleep 5
 
 def _spawn_real_client(tmpdir, session_id, cwd=None):
     """Spawn the real scripts/pi_rpc_client.py against a fake sleeping pi."""
+    tmpdir = str(tmpdir)
     bin_dir = os.path.join(tmpdir, "bin")
     os.makedirs(bin_dir, exist_ok=True)
     fake_pi = os.path.join(bin_dir, "pi")

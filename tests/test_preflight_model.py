@@ -35,38 +35,31 @@ def _launch(**over):
     return _parse(pi_launch({**payload, **over}))
 
 
-def test_preflight_rejects_unknown_model_alias(tmp_path):
-    # given a deployment whose list does not carry the requested alias
+def test_preflight_model_alias_contract(tmp_path):
+    # an alias outside the deployment list is refused, naming alias and valid ids
     _write_deployment(tmp_path, ["default-alias", "heavy-alias"])
     result = _launch(model="not-an-alias")
-    # then preflight fails and names the alias plus valid ids
     assert "error" in result, result
     assert result["error"].startswith("preflight"), result
     assert "not-an-alias" in result["error"], result["error"]
     assert "heavy-alias" in result["error"], result["error"]
 
-
-def test_preflight_accepts_known_model_alias(tmp_path):
-    # given an alias present in the deployment list
+    # an alias present in the deployment list lands on the worker argv
     _write_deployment(tmp_path, ["default-alias", "heavy-alias"])
     result = _launch(model="heavy-alias")
-    # then the launch succeeds and the alias lands on the worker argv
     assert "error" not in result, result
     parts = shlex.split(result["command"])
     assert parts[parts.index("--model") + 1] == "heavy-alias", parts
 
-
-def test_preflight_accepts_alias_equal_to_default_model(tmp_path):
-    # given an alias absent from models.json but equal to settings.json defaultModel
+    # an alias absent from models.json but equal to settings.json defaultModel passes
     _write_deployment(tmp_path, ["default-alias"], default="heavy-alias")
     result = _launch(model="heavy-alias")
     assert "error" not in result, result
 
 
-def test_preflight_warns_when_model_list_unreadable(tmp_path):
-    # given no models.json in the agent dir at all
+def test_preflight_model_warn_rows(tmp_path):
+    # an unverifiable alias degrades to a warn row and the command still ships
     result = _launch(model="not-an-alias")
-    # then no failure: a warn row degrades the check and the command is emitted
     assert "error" not in result, result
     warnings = result.get("warnings", [])
     assert any(
@@ -74,12 +67,9 @@ def test_preflight_warns_when_model_list_unreadable(tmp_path):
     ), warnings
     assert "--model not-an-alias" in " ".join(shlex.split(result["command"]))
 
-
-def test_preflight_warns_when_model_absent(tmp_path):
-    # given no model parameter
+    # no model parameter: a warn row tells the caller pi's defaultModel will run
     _write_deployment(tmp_path, ["default-alias"], default="heavy-alias")
     result = _launch()
-    # then a warn row tells the caller pi's defaultModel will run
     assert "error" not in result, result
     warnings = result.get("warnings", [])
     assert any("defaultModel" in w and "heavy-alias" in w for w in warnings), warnings

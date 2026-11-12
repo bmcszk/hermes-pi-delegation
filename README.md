@@ -41,6 +41,16 @@ error), omitting `model` draws a warning that the worker runs pi's
 `defaultModel`, and `epic_id` + `task_slug` set together are rejected (mutually
 exclusive; `epic_id` wins the session id).
 
+---
+
+**Project-agnostic skill**: The delegation laws taught by this plugin are
+also shipped as a standalone skill at `skills/pi-delegation/SKILL.md` (and
+mirrored in this README). A fresh agent with ONLY the repo can run a gated
+dispatch end-to-end following just the skill + README — no external skills
+required.
+
+---
+
 Worker types carry tool policy; what each is FOR and what its deliverable is:
 
 | Worker type | Purpose | Deliverable | Tools | codemode | thinking |
@@ -100,6 +110,21 @@ session itself is untouched. `resumed_by: call-wait-again` appears only while
 the session is still settling — waiting again is safe, the loop is stateless.
 A budget at or under 1500 s comes back unclamped (`clamped: false`, no hint).
 
+
+### `verify`: one call for the whole exit drill
+
+Exit codes lie in both directions: a run can finish ALL the work and still
+exit 3 with `satisfied=False`, while another exits 0 with the sentinel written
+but the tree dirty. `pi_manage(action="verify", session_id=...)` answers with
+`exit_code`, `uncommitted_files`, `commits_since_base`, `unpushed_commits`, the
+re-checked `deliverable`, and a single top-level `ok` verdict that judges the
+tree rather than the client's claim — exit 3 over a committed, clean, pushed
+tree answers `ok: true` with the contradiction named; exit 0 with residue
+answers `ok: false` naming it. Every leg degrades to a named skip (no upstream,
+no base, non-git cwd), never an error. It is read-only and distinct from
+`salvage_report`: that one is the fast post-exit state dump with per-project
+gates and no remote comparison; `verify` adds the upstream comparison and one
+verdict.
 
 ### `salvage_report` quick gates follow the recorded cwd
 
@@ -278,7 +303,74 @@ The plugin has no runtime dependencies. It needs `pi` on `PATH`, or under a
 per-user install root (`~/.nvm/versions/node/*/bin`, `~/.npm-global/bin`,
 `~/.local/bin`, `~/.bun/bin`).
 
+## First dispatch (copy-paste walkthrough)
+
+A cold-start user with ONLY this repo can run a gated dispatch end-to-end:
+
+**1. Minimal contract** (save as `/abs/project/contract.md`):
+
+```markdown
+Task: add a `hello()` function to `lib.py` that returns "world".
+Scope: only touch `lib.py` and its tests.
+Verification: run `python -c "import lib; assert lib.hello() == 'world'"`.
+Deliverable: `lib.py`.
+
+Finish by appending the single line `TASK-DONE` to `.hermes/lane/task.md`.
+That line is your claim that the work is done.
+```
+
+**2. Paired `pi_launch` JSON**:
+
+```json
+{
+  "contract_path": "/abs/project/contract.md",
+  "cwd": "/abs/project",
+  "worker_type": "coder",
+  "epic_id": "task-hello",
+  "require_edit": ["/abs/project/lib.py", "/abs/project/.hermes/lane/task.md"],
+  "require_sentinel": "TASK-DONE"
+}
+```
+
+**3. Launch → Wait → Read the verdict**:
+
+```sh
+# If pi_launch is in your toolset:
+pi_launch(...)  # returns {command, session_id, next, ...}
+# Run the command through your terminal tool with background=true
+pi_manage(action="wait", session_id="task-hello-coder", timeout_s=1500)
+# Answers: {finished: true, status, exit_code, deliverable, tree, ...}
+# Check: deliverable == "met" AND tree.uncommitted_files == 0 AND tree.unpushed == 0
+# If deliverable == "unmet": the sentinel was absent from the deliverable file.
+# If exit_code == 0 but tree.uncommitted_files > 0: the exit-0-no-edits trap.
+# If exit_code == 3 but tree.uncommitted_files == 0 and tree.unpushed == 0:
+#   the work is done despite the client's verdict (verify will say ok: true).
+```
+
+**4. If the pi tools are NOT in your toolset** (fallback):
+
+```sh
+python3 <plugin>/scripts/pi_rpc_client.py --help
+# Flag names drift between versions; --help is the source.
+```
+
+**Fields you check in the terminal answer**:
+
+| Field | Meaning |
+|-------|---------|
+| `status` | `running` / `done` / `incomplete` / `timeout` / `killed` |
+| `exit_code` | 0=done, 3=incomplete (nudged out), 130=Ctrl-C, 143=SIGTERM |
+| `deliverable` | `met`/`unmet`/`unchecked` (only when `require_sentinel` was set) |
+| `tree` | `dirty`, `commits_since_base`, `unpushed` (git facts, never empty) |
+
+Each field's meaning matches the exit-code table above (no contradictions).
+
 ## Development
+
+Import constraint under the Hermes loader: modules at the plugin root import
+fine, but a module inside `scripts/` must be imported after the guarded
+`sys.path` prepend at the top of `__init__.py` — the loader only puts the
+plugin root on the module path.
 
 ```sh
 uv run --with pytest python -m pytest tests -q

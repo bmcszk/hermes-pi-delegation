@@ -1,3 +1,4 @@
+import glob
 import hashlib
 import importlib.util
 import inspect
@@ -11,7 +12,12 @@ import subprocess
 import sys
 import time
 
-import registry_log
+# The Hermes loader imports this file with module.__path__=[<plugin_dir>] only;
+# scripts/ is not on sys.path, so the import needs the dir prepended first.
+_SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+import registry_log  # noqa: E402
 
 # Constants
 REGISTRY_PATH = os.path.expanduser("~/.hermes/logs/pi-agents.jsonl")
@@ -461,6 +467,7 @@ def register(ctx):
                         "wait",
                         "steer",
                         "salvage_report",
+                        "verify",
                     ],
                 },
                 "session_id": {"type": "string"},
@@ -586,6 +593,8 @@ def _pi_manage_impl(
         if result["clamped"] and not result["finished"]:
             result["resumed_by"] = "call-wait-again"
         return result
+    if action == "verify":
+        return _verify_session(session_id)
     if action == "doctor":
         return _doctor()
     if action == "logs":
@@ -612,6 +621,8 @@ def _pi_manage_impl(
             lock = _lane_lock_info(agent.get("cwd"), agent.get("session"))
             if lock is not None:
                 agent["lane_lock"] = {"present": True, "stale": lock["stale"]}
+            if _wait_finished(agent):
+                agent["tree"] = _tree_summary(agent.get("cwd"), agent.get("base"))
         agents.sort(key=lambda e: e.get("started", ""), reverse=True)
         return {"agents": agents}
 
@@ -642,12 +653,42 @@ def _pi_manage_impl(
                 _registry_update(
                     session_id, pid, status="killed", exit_code=143, finished=_now_iso()
                 )
-                return {"status": f"SIGTERM sent to pgid {pid} ({session_id})"}
+                return {
+                    "status": f"SIGTERM sent to pgid {pid} ({session_id})",
+                    "recovery": f"pi_manage(action='salvage_report', session_id='{session_id}')",
+                }
         if seen_dead_pid is not None:
             return {
-                "status": f"session {session_id} already dead (pid {seen_dead_pid}, marked dead)"
+                "status": f"session {session_id} already dead (pid {seen_dead_pid}, marked dead)",
+                "recovery": f"pi_manage(action='salvage_report', session_id='{session_id}')",
             }
         return {"error": f"Session {session_id} not found in registry"}
+
+
+def _tree_summary(cwd, base):
+    """Read-only tree facts for one row's cwd: dirty count, commits since the
+    row's launch base, unpushed count. Budget-bounded and best-effort: any leg
+    that cannot be established degrades to a named skip instead of raising, so
+    an answer that cannot read the tree never reads as "clean"."""
+    if not cwd or not os.path.isdir(cwd) or not _git_readonly(cwd, "status")[0]:
+        return {"skipped": "no recorded cwd" if not cwd else f"cwd is not a git repo: {cwd}"}
+    tree = {}
+    ok, out = _git_readonly(cwd, "status", "--porcelain")
+    tree["dirty"] = len(out.splitlines()) if ok else {"skipped": out}
+    if _base_is_valid(cwd, base):
+        ok, out = _git_readonly(cwd, "rev-list", "--count", f"{base}..HEAD")
+        tree["commits_since_base"] = int(out) if ok else {"skipped": out}
+    else:
+        tree["commits_since_base"] = {
+            "skipped": "no base recorded for this row" if not base else "unknown revision"
+        }
+    ok_up, up_out = _git_readonly(cwd, "rev-parse", "--abbrev-ref", "@{upstream}")
+    if ok_up:
+        ok, out = _git_readonly(cwd, "rev-list", "--count", f"{up_out.strip()}..HEAD")
+        tree["unpushed"] = int(out) if ok else {"skipped": out}
+    else:
+        tree["unpushed"] = {"skipped": "no upstream configured"}
+    return tree
 
 
 def _wait_result(session_id, entry):
@@ -668,6 +709,11 @@ def _wait_result(session_id, entry):
         result["exit_code"] = entry["exit_code"]
     if entry.get("deliverable") is not None:
         result["deliverable"] = entry["deliverable"]
+    if result["finished"]:
+        result["tree"] = _tree_summary(entry.get("cwd"), entry.get("base"))
+        status = entry.get("status") or "running"
+        if status in ("incomplete", "timeout", "killed"):
+            result["recovery"] = f"pi_manage(action='salvage_report', session_id='{session_id}')"
     return result
 
 
@@ -858,6 +904,84 @@ def _salvage_report(session_id, lines=12, go_tests=False):
     }
 
 
+def _verify_session(session_id):
+    """One-call, read-only exit drill for a recorded session: the registry's
+    exit facts plus the tree facts that override them, combined into a single
+    ok verdict. Exit codes lie in both directions - exit 3 with a fully
+    committed and pushed tree is a completed run, exit 0 with uncommitted
+    residue is not - so the verdict judges the tree, and names whichever
+    contradiction it found. Every leg degrades to a named skip, never raises.
+    Distinct from salvage_report: that one is the fast post-exit state dump
+    with per-project gates; verify adds the upstream comparison and one verdict.
+    """
+    entry = _newest_registry_entry(session_id)
+    if entry is None:
+        return {"finished": False, "status": "unknown"}
+    cwd = entry.get("cwd")
+    tree = _tree_summary(cwd, entry.get("base"))
+    uncommitted = tree["dirty"] if isinstance(tree["dirty"], int) else None
+    verdict = _deliverable_verdict_for_row(entry, cwd)
+    result = {
+        "session": session_id,
+        "finished": _wait_finished(entry),
+        "status": entry.get("status") or "running",
+        "exit_code": entry.get("exit_code"),
+        "uncommitted_files": uncommitted,
+        "commits_since_base": tree["commits_since_base"],
+        "unpushed_commits": tree["unpushed"],
+        "tree": tree,
+        "deliverable": verdict,
+    }
+    result["ok"], result["note"] = _verify_verdict(result, tree)
+    return result
+
+
+def _deliverable_verdict_for_row(entry, cwd):
+    """Re-check the row's sentinel against its deliverable file, or pass the
+    recorded verdict through when the row never armed a sentinel. A relative
+    require_edit path resolves against the row's recorded cwd."""
+    sentinel = entry.get("require_sentinel")
+    if not sentinel:
+        return entry.get("deliverable") or "unchecked"
+    path = entry.get("require_edit")
+    if isinstance(path, list):
+        path = path[0] if path else None
+    import pi_rpc_client
+
+    if path and not os.path.isabs(path):
+        path = os.path.join(cwd or ".", path)
+    return pi_rpc_client._deliverable_verdict(path, sentinel)
+
+
+def _verify_verdict(result, tree):
+    """(ok, note) from the verify legs: tree clean, nothing unpushed, and
+    either client-satisfied or the done-anyway contradiction named."""
+    residue = [
+        name
+        for name in ("dirty", "commits_since_base", "unpushed")
+        if isinstance(tree.get(name), dict)
+    ]
+    note_parts = []
+    if result["uncommitted_files"]:
+        note_parts.append(
+            f"exit {result['exit_code']} but "
+            f"{result['uncommitted_files']} uncommitted file(s) remain"
+        )
+    if isinstance(tree.get("unpushed"), int) and tree["unpushed"]:
+        note_parts.append(f"{tree['unpushed']} unpushed commit(s)")
+    exit_zero_unmet = result["exit_code"] == 0 and result["deliverable"] == "unmet"
+    if exit_zero_unmet:
+        note_parts.append("exit 0 but the sentinel is absent from the deliverable")
+    if note_parts:
+        return False, "; ".join(note_parts)
+    if result["exit_code"] not in (0, None) and not residue:
+        return True, (
+            f"exit {result['exit_code']} yet the tree is committed, clean and pushed: "
+            "the work is done despite the client's own verdict"
+        )
+    return True, ""
+
+
 def _dispatch_command(command, cwd, session_id):
     """auto=true: run the generated one-liner detached, log to the lane dir.
 
@@ -883,7 +1007,13 @@ def _dispatch_command(command, cwd, session_id):
             )
     except OSError as exc:
         return {"error": f"$dispatch failed to spawn: {exc}", "log": log_path}
-    return {"dispatched": True, "pid": proc.pid, "session_id": session_id, "log": log_path}
+    return {
+        "dispatched": True,
+        "pid": proc.pid,
+        "session_id": session_id,
+        "log": log_path,
+        "next": f"pi_manage(action='wait', session_id='{session_id}', timeout_s<=1500)",
+    }
 
 
 def _doctor():
@@ -926,7 +1056,6 @@ def _transcript_for(session_id):
     its filename lacks the session slug), then the legacy slug glob for rows
     recorded before that fix.
     """
-    import glob
 
     entry = _newest_registry_entry(session_id)
     if entry is not None:
@@ -1067,6 +1196,74 @@ def _anchor_header(path):
     return f"## {slug} lane log (append-only)"
 
 
+def _launch_concurrency_warnings(session_id, cwd, agent_dir):
+    """Registry-fact warnings for a dispatch about to launch: session-id reuse
+    (pi resumes that session's context), another live worker on the same
+    cwd (shared registry/transcript state), and another live worker on the
+    same agent_dir (shared registry rewrite, heartbeat/steer namespace,
+    transcript discovery). Warnings, never blocks."""
+    warnings = []
+    prior = None
+    for entry in _read_registry():
+        if entry.get("session") == session_id and entry.get("status") != "running":
+            if prior is None or _entry_stamp(entry) >= _entry_stamp(prior):
+                prior = entry
+        elif (
+            entry.get("cwd") == cwd
+            and entry.get("status") == "running"
+            and entry.get("session") != session_id
+            and _pid_alive(entry.get("pid"))
+        ):
+            warnings.append(
+                f"preflight warn: session {entry.get('session')} (pid {entry.get('pid')}) is "
+                "already running in this directory - one worker per project directory at a "
+                "time; concurrent runs share registry and transcript state"
+            )
+        elif (
+            entry.get("status") == "running"
+            and _pid_alive(entry.get("pid"))
+            and entry.get("agent_dir")
+            and entry.get("agent_dir") == (agent_dir or "default")
+            and entry.get("session") != session_id
+        ):
+            warnings.append(
+                f"preflight warn: session {entry.get('session')} (pid {entry.get('pid')}) "
+                f"is running with the same agent dir ({entry.get('agent_dir')}); "
+                "registry, heartbeat and transcript state are shared"
+            )
+    if prior is not None:
+        when = prior.get("finished") or prior.get("started") or "an unknown time"
+        warnings.append(
+            f"preflight warn: session {session_id} has prior finished runs (last status "
+            f"{prior.get('status')!r} at {when}); pi will resume that session's context - "
+            "pass epic_id/task_slug for a fresh id"
+        )
+    return warnings
+
+
+def _stale_lane_lock_warnings(cwd):
+    """Stale-lock visibility at launch: glob-scan <cwd>/.hermes/lane/LOCK for
+    locks whose payload pid is dead and name the path, owning session, and the
+    exact rm command (same wording salvage_report uses). The launch itself
+    removes nothing - removal stays a human decision."""
+    warnings = []
+    lock_dir = os.path.join(cwd, ".hermes", "lane", "LOCK")
+    try:
+        lock_files = sorted(glob.glob(os.path.join(lock_dir, "*.lock")))
+    except Exception:
+        return warnings
+    for path in lock_files:
+        info = _lane_lock_info(cwd, os.path.splitext(os.path.basename(path))[0])
+        if info is None or not info["stale"]:
+            continue
+        owner = info["payload"].get("session_id") or "unknown session"
+        warnings.append(
+            f"preflight warn: stale lane lock in this directory (crash leftover from "
+            f"{owner}): {path} - remove it with: rm {path}"
+        )
+    return warnings
+
+
 def _preflight(
     cwd,
     contract_path,
@@ -1144,6 +1341,12 @@ def _preflight(
             "auditor - mode aims at no deliverable: require_edit names the file the "
             "final text is written into"
         )
+    if worker_type == "coder" and not require_edit:
+        warnings.append(
+            "preflight warn: coder without require_edit - a worker that ends its turn "
+            "early yields exit 0 with zero edits and no gate catches it; pass require_edit "
+            "to arm the nudge gate"
+        )
     min_calls = 0 if min_tool_calls is _UNSET else int(min_tool_calls or 0)
     max_nudges = 0 if max_nudges is _UNSET else int(max_nudges or 0)
     if max_nudges > 0 and min_calls < 1:
@@ -1160,6 +1363,17 @@ def _preflight(
             "require_sentinel - set without require_edit: the sentinel check has no file to "
             "grep; name the deliverable file in require_edit"
         )
+    elif require_sentinel:
+        try:
+            with open(os.path.expanduser(contract_path), encoding="utf-8", errors="replace") as f:
+                contract_text = f.read()
+            if require_sentinel not in contract_text:
+                warnings.append(
+                    f"preflight warn: sentinel {require_sentinel!r} never appears in the "
+                    "contract; the worker has no instruction to write it"
+                )
+        except OSError:
+            pass  # the exists-check above already fails the launch for this file
 
     if not (
         os.path.isfile(os.path.join(cwd, ".beans.yml"))
@@ -1274,7 +1488,13 @@ def _pi_launch_impl(
     failures += preflight_skill_failures
     if failures:
         return {"error": "preflight: " + "; ".join(failures)}
-    warnings = preflight_warnings + warnings
+    resolved_agent_dir = WORKER_AGENT_DIR if os.path.isdir(WORKER_AGENT_DIR) else "default"
+    warnings = (
+        preflight_warnings
+        + _launch_concurrency_warnings(session_id, cwd, resolved_agent_dir)
+        + warnings
+    )
+    warnings += _stale_lane_lock_warnings(cwd)
 
     # Single-line POSIX command, shlex-quoted throughout. Double quotes around
     # $(cat ...) so command substitution happens at shell level.
@@ -1382,6 +1602,7 @@ def _pi_launch_impl(
         "session_id": session_id,
         "worker_type": worker_type,
         "mode": mode,
+        "next": f"pi_manage(action='wait', session_id='{session_id}', timeout_s<=1500)",
     }
     if require_sentinel:
         result["require_sentinel"] = require_sentinel

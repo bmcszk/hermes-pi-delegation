@@ -1,8 +1,13 @@
+"""salvage: one-call report collection, git legs from the recorded cwd,
+lane locks (real subprocess), and gates that run in the row's tree."""
+
 import json
 import os
+import pathlib
 import subprocess
 import time
 
+import pytest
 from helpers import (
     _parse,
     _setup_registry,
@@ -21,26 +26,49 @@ GIT_IDENTITY_ENV = {
 }
 
 
-def _make_repo(pwd):
-    """Init a tmp git repo: one base commit, then one later 'work' commit."""
+def _make_repo(pwd, dirty=True):
+    """Init a tmp git repo: one base commit, one 'work' commit, uncommitted edit."""
     env = {**os.environ, **GIT_IDENTITY_ENV}
     subprocess.run(["git", "init", "-q", "-b", "main", pwd], check=True, env=env)
-    subprocess.run(["git", "config", "user.email", "s@t"], cwd=pwd, check=True, env=env)
-    subprocess.run(["git", "config", "user.name", "s"], cwd=pwd, check=True, env=env)
+    subprocess.run(["git", "-C", pwd, "config", "user.email", "s@t"], check=True, env=env)
+    subprocess.run(["git", "-C", pwd, "config", "user.name", "s"], check=True, env=env)
     with open(os.path.join(pwd, "a.txt"), "w") as f:
         f.write("base\n")
-    subprocess.run(["git", "add", "a.txt"], cwd=pwd, check=True, env=env)
-    subprocess.run(["git", "commit", "-qm", "base commit"], cwd=pwd, check=True, env=env)
+    subprocess.run(["git", "-C", pwd, "add", "a.txt"], check=True, env=env)
+    subprocess.run(["git", "-C", pwd, "commit", "-qm", "base commit"], check=True, env=env)
     base = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=pwd, check=True, capture_output=True, text=True, env=env
+        ["git", "-C", pwd, "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
     ).stdout.strip()
-    with open(os.path.join(pwd, "a.txt"), "w") as f:
-        f.write("changed\n")
-    subprocess.run(["git", "add", "a.txt"], cwd=pwd, check=True, env=env)
-    subprocess.run(["git", "commit", "-qm", "work commit"], cwd=pwd, check=True, env=env)
-    with open(os.path.join(pwd, "a.txt"), "w") as f:
-        f.write("uncommitted\n")
+    if dirty:
+        with open(os.path.join(pwd, "a.txt"), "w") as f:
+            f.write("changed\n")
+        subprocess.run(["git", "-C", pwd, "add", "a.txt"], check=True, env=env)
+        subprocess.run(["git", "-C", pwd, "commit", "-qm", "work commit"], check=True, env=env)
+        with open(os.path.join(pwd, "a.txt"), "w") as f:
+            f.write("uncommitted\n")
     return base
+
+
+def _salvage_row(tmp_path, cwd, session="epicSal-coder", **extra):
+    _setup_registry(str(tmp_path))
+    _write_registry(
+        {
+            "session": session,
+            "pid": 999999,
+            "status": "killed",
+            "cwd": cwd,
+            "started": "2024-01-01T00:00:00",
+            **extra,
+        }
+    )
+    try:
+        return _parse(p._pi_manage_impl("salvage_report", session_id=session))
+    finally:
+        _teardown_registry()
 
 
 def test_salvage_report_collects_one_call(tmp_path):
@@ -59,136 +87,58 @@ def test_salvage_report_collects_one_call(tmp_path):
         )
         + "\n"
     )
-    _setup_registry(str(tmp_path))
-    try:
-        _write_registry(
-            {
-                "session": "epicSal-coder",
-                "pid": 999999,
-                "status": "killed",
-                "exit_code": 143,
-                "cwd": repo,
-                "base": base,
-                "log_path": str(transcript),
-                "started": "2024-01-01T00:00:00",
-            }
-        )
-        result = _parse(p._pi_manage_impl("salvage_report", session_id="epicSal-coder", lines=5))
-        assert "error" not in result, result
-        assert result["session"] == "epicSal-coder"
-        assert result["cwd"] == repo
-        assert result["base"] == base
-        assert "collected_at" in result
-        assert result["git"]["status"].strip(), result["git"]
-        assert result["git"]["commits_since_base"][0].endswith("work commit"), result["git"]
-        assert any("a.txt" in line for line in result["git"]["diff_stat"]), result["git"]
-        assert result["git"]["branch_head"], result["git"]
-        assert result["frames"]["path"] == str(transcript), result
-        assert result["frames"]["tool_calls"] == 1, result["frames"]
-        # gates follow the RECORDED cwd's project type: this row's repo has no
-        # project marker, so the report names the skip instead of borrowing the
-        # plugin repo's checks
-        gates = {row["name"]: row for row in result["gates"]}
-        assert result["project_type"] == "unknown", result
-        assert set(gates) == {"project-type"}, gates
-        assert gates["project-type"]["skipped"], gates
-    finally:
-        _teardown_registry()
-
-
-def test_salvage_report_git_facts_from_recorded_cwd(tmp_path):
-    """The git facts describe the row's recorded cwd, not the process cwd."""
-    repo = str(tmp_path / "repo")
-    base = _make_repo(repo)
+    # the git facts describe the row's recorded cwd, not the process cwd: an
+    # unrelated empty cwd would make "git log" fail; the recorded cwd works
     other = str(tmp_path / "elsewhere-empty")
     os.makedirs(other)
-    _setup_registry(str(tmp_path))
     old_cwd = os.getcwd()
     os.chdir(other)
     try:
-        _write_registry(
-            {
-                "session": "epicCwd-coder",
-                "pid": 999999,
-                "status": "killed",
-                "cwd": repo,
-                "base": base,
-                "started": "2024-01-01T00:00:00",
-            }
-        )
-        result = _parse(p._pi_manage_impl("salvage_report", session_id="epicCwd-coder"))
-        assert "error" not in result, result
-        # an unrelated empty cwd would make "git log" fail; the recorded cwd works
-        assert result["git"]["commits_since_base"][0].endswith("work commit"), result["git"]
-        assert result["cwd"] == repo
+        result = _salvage_row(tmp_path, repo, base=base, log_path=str(transcript))
     finally:
         os.chdir(old_cwd)
-        _teardown_registry()
+    assert "error" not in result, result
+    assert result["session"] == "epicSal-coder"
+    assert result["cwd"] == repo
+    assert result["base"] == base
+    assert "collected_at" in result
+    assert result["git"]["status"].strip(), result["git"]
+    assert result["git"]["commits_since_base"][0].endswith("work commit"), result["git"]
+    assert any("a.txt" in line for line in result["git"]["diff_stat"]), result["git"]
+    assert result["git"]["branch_head"], result["git"]
+    assert result["frames"]["path"] == str(transcript), result
+    assert result["frames"]["tool_calls"] == 1, result["frames"]
+    # gates follow the RECORDED cwd's project type: this row's repo has no
+    # project marker, so the report names the skip instead of borrowing the
+    # plugin repo's checks
+    gates = {row["name"]: row for row in result["gates"]}
+    assert result["project_type"] == "unknown", result
+    assert set(gates) == {"project-type"}, gates
+    assert gates["project-type"]["skipped"], gates
 
 
-def test_salvage_report_missing_base_reports_named_skips(tmp_path):
-    """No base row field: commits_since_base/diff_stat carry skip reasons,
-    the rest of the report still lands."""
+@pytest.mark.parametrize(
+    ("base", "expect_skip_text"),
+    [
+        pytest.param(None, "no base recorded", id="missing-base"),
+        pytest.param("0" * 40, "unknown revision", id="invalid-base"),
+    ],
+)
+def test_salvage_report_bad_base_reports_named_skips(base, expect_skip_text, tmp_path):
     repo = str(tmp_path / "repo")
     _make_repo(repo)
-    _setup_registry(str(tmp_path))
-    try:
-        _write_registry(
-            {
-                "session": "epicNoBase-coder",
-                "pid": 999999,
-                "status": "killed",
-                "cwd": repo,
-                "started": "2024-01-01T00:00:00",
-            }
-        )
-        result = _parse(p._pi_manage_impl("salvage_report", session_id="epicNoBase-coder"))
-        assert "error" not in result, result
-        assert result["base"] is None, result["base"]
-        assert "skipped" in result["git"]["commits_since_base"], result["git"]
-        assert "no base recorded" in result["git"]["commits_since_base"]["skipped"].lower(), result[
-            "git"
-        ]
-        assert "skipped" in result["git"]["diff_stat"], result["git"]
-        assert result["git"]["status"], result["git"]
-    finally:
-        _teardown_registry()
+    over = {} if base is None else {"base": base}
+    result = _salvage_row(tmp_path, repo, session="epicBadBase-coder", **over)
+    assert "error" not in result, result
+    assert result["base"] is None or "skipped" in result["git"]["commits_since_base"], result
+    assert "skipped" in result["git"]["commits_since_base"], result["git"]
+    assert expect_skip_text in result["git"]["commits_since_base"]["skipped"].lower(), result["git"]
+    assert "skipped" in result["git"]["diff_stat"], result["git"]
+    assert result["git"]["status"], result["git"]
 
-
-def test_salvage_report_invalid_base_reports_named_skips(tmp_path):
-    """A base the repo does not know: named skip, not an exception."""
-    repo = str(tmp_path / "repo")
-    _make_repo(repo)
-    _setup_registry(str(tmp_path))
-    try:
-        _write_registry(
-            {
-                "session": "epicBadBase-coder",
-                "pid": 999999,
-                "status": "killed",
-                "cwd": repo,
-                "base": "0" * 40,
-                "started": "2024-01-01T00:00:00",
-            }
-        )
-        result = _parse(p._pi_manage_impl("salvage_report", session_id="epicBadBase-coder"))
-        assert "error" not in result, result
-        assert "skipped" in result["git"]["commits_since_base"], result["git"]
-        assert "unknown revision" in result["git"]["commits_since_base"]["skipped"].lower(), result[
-            "git"
-        ]
-    finally:
-        _teardown_registry()
-
-
-def test_salvage_report_unknown_session_error_unchanged(tmp_path):
-    """No registry rows for the session: the existing unknown shape."""
-    _setup_registry(str(tmp_path))
-    try:
-        result = _parse(p._pi_manage_impl("salvage_report", session_id="epicGhost-coder"))
-        assert result["finished"] is False and result["status"] == "unknown", result
-    finally:
-        _teardown_registry()
+    # unknown is reserved for a session with no registry rows at all
+    unknown = _parse(p._pi_manage_impl("salvage_report", session_id="epicNever-coder"))
+    assert unknown["finished"] is False and unknown["status"] == "unknown", unknown
 
 
 def _lane_lock_path(cwd, session_id):
@@ -242,28 +192,23 @@ def test_lane_lock_stale_after_crash_surfaced_and_reported(tmp_path):
     with open(os.path.join(proj, "AGENTS.md"), "w") as f:
         f.write("marker\n")
     session = "task-lockstale-default"
-    _setup_registry(str(tmp_path))
     lock_dir = os.path.join(proj, ".hermes", "lane", "LOCK")
     os.makedirs(lock_dir)
     lock_path = os.path.join(lock_dir, f"{session}.lock")
     dead_pid = 999999
     with open(lock_path, "w") as f:
         json.dump({"session_id": session, "pid": dead_pid, "model": "m", "started_at": "now"}, f)
-    _write_registry(
-        {
-            "session": session,
-            "pid": dead_pid,
-            "status": "running",
-            "cwd": proj,
-            "started": "2024-01-01T00:00:00",
-        }
+    result = _salvage_row(
+        tmp_path,
+        proj,
+        session=session,
+        pid=dead_pid,
+        status="running",
     )
-
     agents = _parse(p._pi_manage_impl("list"))["agents"]
     mine = next(a for a in agents if a["session"] == session)
     assert mine["lane_lock"] == {"present": True, "stale": True}, mine
 
-    result = _parse(p._pi_manage_impl("salvage_report", session_id=session))
     lock_row = result.get("lane_lock")
     assert lock_row, result
     assert lock_row["path"] == lock_path
@@ -271,29 +216,11 @@ def test_lane_lock_stale_after_crash_surfaced_and_reported(tmp_path):
     assert f"rm {lock_path}" in lock_row["removal"], lock_row
     # the action itself deletes nothing
     assert os.path.exists(lock_path)
-    _teardown_registry()
 
 
-def _salvage_row_setup(tmp_path, cwd, **extra):
-    """Informal helper: registry row wired for salvage cwd tests."""
-    _setup_registry(str(tmp_path))
-    _write_registry(
-        {
-            "session": "epicRev-coder",
-            "pid": 999999,
-            "status": "killed",
-            "cwd": cwd,
-            "started": "2024-01-01T00:00:00",
-            **extra,
-        }
-    )
-
-
-def test_salvage_gates_run_in_recorded_cwd(tmp_path, monkeypatch):
+def test_salvage_gates_run_in_recorded_cwd(tmp_path):
     """A tmp repo whose gate command fails, while the process cwd passes:
     the row must report the tmp repo's failure, not the caller's."""
-    import pathlib
-
     repo = str(tmp_path / "proj")
     pathlib.Path(repo).mkdir()
     with open(os.path.join(repo, "AGENTS.md"), "w") as f:
@@ -304,50 +231,31 @@ def test_salvage_gates_run_in_recorded_cwd(tmp_path, monkeypatch):
     # the tmp repo FAILS the compileall gate deterministically: broken syntax
     with open(os.path.join(repo, "__init__.py"), "w") as f:
         f.write("def broken(:\n")
-    _salvage_row_setup(tmp_path, repo)
     old_cwd = os.getcwd()
     os.chdir(str(tmp_path))  # process cwd is OUTSIDE the row's cwd
     try:
-        result = _parse(p._pi_manage_impl("salvage_report", session_id="epicRev-coder"))
+        result = _salvage_row(tmp_path, repo, session="epicRev-coder")
         assert "error" not in result, result
         compile_row = next(r for r in result["gates"] if r["name"] == "compileall")
         assert compile_row["ok"] is False, compile_row
         assert "broken" in compile_row["output_tail"], compile_row
     finally:
         os.chdir(old_cwd)
-        _teardown_registry()
 
-
-def test_salvage_git_legs_work_in_worktree(tmp_path):
-    """git worktree checkout as the row cwd: git legs populated, not skipped."""
-    repo = str(tmp_path / "seed")
-    env = {**os.environ, **GIT_IDENTITY_ENV}
-    subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True, env=env)
-    subprocess.run(["git", "-C", repo, "config", "user.email", "s@t"], check=True, env=env)
-    subprocess.run(["git", "-C", repo, "config", "user.name", "s"], check=True, env=env)
-    with open(os.path.join(repo, "a.md"), "w") as f:
-        f.write("seed\n")
-    subprocess.run(["git", "-C", repo, "add", "a.md"], check=True, env=env)
-    subprocess.run(["git", "-C", repo, "commit", "-qm", "base commit"], check=True, env=env)
-    base = subprocess.run(
-        ["git", "-C", repo, "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-        env=env,
-    ).stdout.strip()
+    # and a git worktree checkout as the row cwd: git legs populated, not skipped
+    seed = str(tmp_path / "seed")
+    base = _make_repo(seed, dirty=False)
     wt = str(tmp_path / "lane-wt")
-    subprocess.run(["git", "-C", repo, "worktree", "add", "-q", wt], check=True, env=env)
-    with open(os.path.join(wt, "a.md"), "w") as f:
+    env = {**os.environ, **GIT_IDENTITY_ENV}
+    subprocess.run(["git", "-C", seed, "worktree", "add", "-q", wt], check=True, env=env)
+    with open(os.path.join(wt, "a.txt"), "w") as f:
         f.write("worktree edit\n")
-    subprocess.run(["git", "-C", wt, "add", "a.md"], check=True, env=env)
+    subprocess.run(["git", "-C", wt, "add", "a.txt"], check=True, env=env)
     subprocess.run(["git", "-C", wt, "commit", "-qm", "work commit"], check=True, env=env)
-    with open(os.path.join(wt, "a.md"), "w") as f:
+    with open(os.path.join(wt, "a.txt"), "w") as f:
         f.write("worktree edit uncommitted\n")
-
-    _salvage_row_setup(tmp_path, wt, base=base)
     try:
-        result = _parse(p._pi_manage_impl("salvage_report", session_id="epicRev-coder"))
+        result = _salvage_row(tmp_path, wt, session="epicRev-coder", base=base)
         assert "error" not in result, result
         assert result["git"]["status"].strip(), result["git"]
         csb = result["git"]["commits_since_base"]
@@ -355,6 +263,5 @@ def test_salvage_git_legs_work_in_worktree(tmp_path):
         assert csb[0].endswith("work commit"), csb
     finally:
         subprocess.run(
-            ["git", "-C", repo, "worktree", "remove", "--force", wt], check=True, env=env
+            ["git", "-C", seed, "worktree", "remove", "--force", wt], check=True, env=env
         )
-        _teardown_registry()
