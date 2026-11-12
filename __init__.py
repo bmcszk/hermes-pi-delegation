@@ -1183,10 +1183,12 @@ def _anchor_header(path):
     return f"## {slug} lane log (append-only)"
 
 
-def _launch_concurrency_warnings(session_id, cwd):
+def _launch_concurrency_warnings(session_id, cwd, agent_dir):
     """Registry-fact warnings for a dispatch about to launch: session-id reuse
-    (pi resumes that session's context) and another live worker on the same
-    cwd (shared registry/transcript state). Warnings, never blocks."""
+    (pi resumes that session's context), another live worker on the same
+    cwd (shared registry/transcript state), and another live worker on the
+    same agent_dir (shared registry rewrite, heartbeat/steer namespace,
+    transcript discovery). Warnings, never blocks."""
     warnings = []
     prior = None
     for entry in _read_registry():
@@ -1203,6 +1205,18 @@ def _launch_concurrency_warnings(session_id, cwd):
                 f"preflight warn: session {entry.get('session')} (pid {entry.get('pid')}) is "
                 "already running in this directory - one worker per project directory at a "
                 "time; concurrent runs share registry and transcript state"
+            )
+        elif (
+            entry.get("status") == "running"
+            and _pid_alive(entry.get("pid"))
+            and entry.get("agent_dir")
+            and entry.get("agent_dir") == (agent_dir or "default")
+            and entry.get("session") != session_id
+        ):
+            warnings.append(
+                f"preflight warn: session {entry.get('session')} (pid {entry.get('pid')}) "
+                f"is running with the same agent dir ({entry.get('agent_dir')}); "
+                "registry, heartbeat and transcript state are shared"
             )
     if prior is not None:
         when = prior.get("finished") or prior.get("started") or "an unknown time"
@@ -1461,7 +1475,12 @@ def _pi_launch_impl(
     failures += preflight_skill_failures
     if failures:
         return {"error": "preflight: " + "; ".join(failures)}
-    warnings = preflight_warnings + _launch_concurrency_warnings(session_id, cwd) + warnings
+    resolved_agent_dir = WORKER_AGENT_DIR if os.path.isdir(WORKER_AGENT_DIR) else "default"
+    warnings = (
+        preflight_warnings
+        + _launch_concurrency_warnings(session_id, cwd, resolved_agent_dir)
+        + warnings
+    )
     warnings += _stale_lane_lock_warnings(cwd)
 
     # Single-line POSIX command, shlex-quoted throughout. Double quotes around

@@ -590,6 +590,66 @@ def test_preflight_warns_on_stale_lane_locks(tmp_path):
     assert "error" not in result and "stale" not in json.dumps(result.get("warnings", [])), result
 
 
+def test_preflight_warns_on_same_agent_dir_concurrency(tmp_path, monkeypatch):
+    """A live row carrying the same resolved agent dir draws a warning naming
+    the colliding session id and pid; distinct agent dirs produce no warning."""
+    # Mock deployment models so "m" is a known alias (avoids the
+    # "not verifiable against the deployment list" warning which is
+    # orthogonal to the agent-dir concurrency check).
+    monkeypatch.setattr(p, "_deployment_models",
+                        lambda d: (["m", "other-model"], "m", True))
+    # Redirect the global REGISTRY_PATH to the temp path so
+    # _read_registry() sees our seeded rows.
+    reg_path = str(tmp_path / "pi-agents.jsonl")
+    monkeypatch.setattr(p, "REGISTRY_PATH", reg_path)
+    proj = _marked_project(str(tmp_path))
+    contract = os.path.join(proj, "contract.md")
+    payload = {
+        "worker_type": "coder",
+        "model": "m",
+        "skills": [],
+        "contract_path": contract,
+        "cwd": proj,
+        "min_tool_calls": 0,
+        "require_edit": os.path.join(proj, "a.go"),
+    }
+    # seed a live row with the resolved agent dir (default)
+    # Use the patched WORKER_AGENT_DIR (conftest sets it to a temp dir)
+    agent_dir = p.WORKER_AGENT_DIR if os.path.isdir(p.WORKER_AGENT_DIR) else "default"
+    p.REGISTRY_PATH = str(tmp_path / "pi-agents.jsonl")
+    with open(p.REGISTRY_PATH, "w") as f:
+        f.write(
+            json.dumps(
+                {
+                    "session": "agentdir-epic-coder",
+                    "pid": os.getpid(),
+                    "status": "running",
+                    "cwd": "/other/project",
+                    "agent_dir": agent_dir,
+                    "started": "2024-01-01T00:00:00",
+                }
+            )
+            + "\n"
+        )
+    try:
+        result = _launch({**payload, "epic_id": "fresh-id"})
+        assert "error" not in result, result
+        warnings = json.dumps(result.get("warnings", []))
+        assert "agentdir-epic-coder" in warnings, result.get("warnings")
+        assert "same agent dir" in warnings, result.get("warnings")
+        # distinct agent dirs produce no warning
+        p.REGISTRY_PATH = str(tmp_path / "empty.jsonl")
+        with open(p.REGISTRY_PATH, "w") as f:
+            f.write("")
+        result = _launch({**payload, "epic_id": "fresh-id"})
+        assert "error" not in result, result
+        assert "same agent dir" not in json.dumps(result.get("warnings", [])), result
+    finally:
+        p.REGISTRY_PATH = str(tmp_path / "restored.jsonl")
+        with open(p.REGISTRY_PATH, "w") as f:
+            f.write("")
+
+
 def _write_registry_line(row):
     import __init__ as pmod
 

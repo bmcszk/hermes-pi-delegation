@@ -331,11 +331,13 @@ def _registry_write(
     require_sentinel=None,
     salvage_patch=None,
     salvage_status=None,
+    agent_dir=None,
 ):
     """Append/update the agent registry line. Never raises, never blocks dispatch.
 
     salvage_patch/salvage_status: the terminal worktree snapshot fields written
     by _salvage_snapshot on terminal-not-done exits (None = clean tree).
+    agent_dir: the resolved --agent-dir value, or "default" when none passed.
     """
     try:
         import datetime
@@ -359,6 +361,8 @@ def _registry_write(
             entry["salvage_patch"] = salvage_patch
         if salvage_status is not None:
             entry["salvage_status"] = salvage_status
+        if agent_dir is not None:
+            entry["agent_dir"] = agent_dir
         if status in ("done", "error", "killed", "timeout"):
             entry["finished"] = now
             _registry_update_running(session_id, entry)
@@ -1020,7 +1024,13 @@ def main(argv: list[str] | None = None) -> int:
         with contextlib.suppress(OSError):
             os.remove(stale_steer)
     client.start()
-    _registry_write(args.session_id or "unnamed", args.model, "running")
+    agent_dir_value = args.agent_dir or "default"
+    _registry_write(
+        args.session_id or "unnamed",
+        args.model,
+        "running",
+        agent_dir=agent_dir_value,
+    )
     _launch_facts = {"cwd": args.cwd, "base": _launch_base_git(args.cwd)}
     _registry_patch(
         args.session_id or "unnamed",
@@ -1076,6 +1086,7 @@ def main(argv: list[str] | None = None) -> int:
             exit_code=exit_code,
             deliverable=_deliverable_verdict(sentinel_path, args.require_sentinel),
             require_sentinel=args.require_sentinel,
+            agent_dir=args.agent_dir or "default",
             **_salvage_fields(status, args.session_id or "unnamed", args.cwd),
         )
         client.close()
