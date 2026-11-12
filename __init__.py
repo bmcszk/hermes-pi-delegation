@@ -11,7 +11,12 @@ import subprocess
 import sys
 import time
 
-import registry_log
+# The Hermes loader imports this file with module.__path__=[<plugin_dir>] only;
+# scripts/ is not on sys.path, so the import needs the dir prepended first.
+_SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+import registry_log  # noqa: E402
 
 # Constants
 REGISTRY_PATH = os.path.expanduser("~/.hermes/logs/pi-agents.jsonl")

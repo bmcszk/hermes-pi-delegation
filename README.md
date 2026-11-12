@@ -280,6 +280,11 @@ per-user install root (`~/.nvm/versions/node/*/bin`, `~/.npm-global/bin`,
 
 ## Development
 
+Import constraint under the Hermes loader: modules at the plugin root import
+fine, but a module inside `scripts/` must be imported after the guarded
+`sys.path` prepend at the top of `__init__.py` — the loader only puts the
+plugin root on the module path.
+
 ```sh
 uv run --with pytest python -m pytest tests -q
 uvx ruff check .
