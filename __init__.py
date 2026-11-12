@@ -1183,6 +1183,37 @@ def _anchor_header(path):
     return f"## {slug} lane log (append-only)"
 
 
+def _launch_concurrency_warnings(session_id, cwd):
+    """Registry-fact warnings for a dispatch about to launch: session-id reuse
+    (pi resumes that session's context) and another live worker on the same
+    cwd (shared registry/transcript state). Warnings, never blocks."""
+    warnings = []
+    prior = None
+    for entry in _read_registry():
+        if entry.get("session") == session_id and entry.get("status") != "running":
+            if prior is None or _entry_stamp(entry) >= _entry_stamp(prior):
+                prior = entry
+        elif (
+            entry.get("cwd") == cwd
+            and entry.get("status") == "running"
+            and entry.get("session") != session_id
+            and _pid_alive(entry.get("pid"))
+        ):
+            warnings.append(
+                f"preflight warn: session {entry.get('session')} (pid {entry.get('pid')}) is "
+                "already running in this directory - one worker per project directory at a "
+                "time; concurrent runs share registry and transcript state"
+            )
+    if prior is not None:
+        when = prior.get("finished") or prior.get("started") or "an unknown time"
+        warnings.append(
+            f"preflight warn: session {session_id} has prior finished runs (last status "
+            f"{prior.get('status')!r} at {when}); pi will resume that session's context - "
+            "pass epic_id/task_slug for a fresh id"
+        )
+    return warnings
+
+
 def _preflight(
     cwd,
     contract_path,
@@ -1407,7 +1438,7 @@ def _pi_launch_impl(
     failures += preflight_skill_failures
     if failures:
         return {"error": "preflight: " + "; ".join(failures)}
-    warnings = preflight_warnings + warnings
+    warnings = preflight_warnings + _launch_concurrency_warnings(session_id, cwd) + warnings
 
     # Single-line POSIX command, shlex-quoted throughout. Double quotes around
     # $(cat ...) so command substitution happens at shell level.

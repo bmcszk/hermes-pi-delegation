@@ -476,6 +476,80 @@ def test_preflight_warns_sentinel_missing_from_contract(contract_text, expect_wa
     ), result
 
 
+def _seeded_registry(tmp_path, *rows):
+    """Point the plugin at a fake registry holding rows; restore at teardown."""
+    backup = p.REGISTRY_PATH
+    p.REGISTRY_PATH = str(tmp_path / "pi-agents.jsonl")
+    with open(p.REGISTRY_PATH, "w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+    return backup
+
+
+def test_preflight_warns_on_session_reuse_and_same_cwd_concurrency(tmp_path):
+    """Launch over a finished session id warns that pi resumes its context;
+    a live sibling on the same cwd warns one-worker-per-project; a fresh id
+    on a quiet cwd warns neither."""
+    proj = _marked_project(str(tmp_path))
+    contract = os.path.join(proj, "contract.md")
+    payload = {
+        "worker_type": "coder",
+        "model": "m",
+        "skills": [],
+        "contract_path": contract,
+        "cwd": proj,
+    }
+    backup = _seeded_registry(
+        tmp_path,
+        {
+            "session": "task-proj-coder",
+            "pid": 999999,
+            "status": "done",
+            "cwd": proj,
+            "started": "2024-01-01T00:00:00",
+        },
+    )
+    try:
+        result = _launch({**payload, "task_slug": "proj"})
+        assert "error" not in result, result
+        warnings = json.dumps(result.get("warnings", []))
+        assert "resume" in warnings and "task-proj-coder" in warnings, result.get("warnings")
+
+        # a live sibling row on the same cwd draws the concurrency warning
+        _write_registry_line(
+            {
+                "session": "other-epic-coder",
+                "pid": os.getpid(),
+                "status": "running",
+                "cwd": proj,
+                "started": "2024-01-02T00:00:00",
+            }
+        )
+        result = _launch({**payload, "epic_id": "fresh-id"})
+        assert "error" not in result, result
+        assert "one worker per project directory" in json.dumps(
+            result.get("warnings", [])
+        ), result.get("warnings")
+
+        # fresh id on a quiet cwd: neither warning
+        p.REGISTRY_PATH = str(tmp_path / "empty.jsonl")
+        with open(p.REGISTRY_PATH, "w") as f:
+            f.write("")
+        result = _launch({**payload, "epic_id": "fresh-id"})
+        assert "error" not in result, result
+        warnings = json.dumps(result.get("warnings", []))
+        assert "resume" not in warnings and "one worker per project" not in warnings, warnings
+    finally:
+        p.REGISTRY_PATH = backup
+
+
+def _write_registry_line(row):
+    import __init__ as pmod
+
+    with open(pmod.REGISTRY_PATH, "a") as f:
+        f.write(json.dumps(row) + "\n")
+
+
 @pytest.mark.parametrize(
     ("worker_type", "with_require_edit", "expect_warn"),
     [
