@@ -210,6 +210,60 @@ def _deliverable_verdict(path, sentinel):
         return "unmet"
 
 
+def _salvage_snapshot(session_id, cwd):
+    """Snapshot the uncommitted worktree at a terminal-not-done exit.
+
+    Writes <cwd>/.hermes/lane/<session>.salvage.patch (a plain `git diff`,
+    size-capped, read-only toward the tree) and returns the registry fields:
+    salvage_patch + salvage_status on success, a named skip otherwise. A clean
+    tree writes nothing. Best-effort: never raises, never alters the exit code.
+    """
+    rel_patch = os.path.join(".hermes", "lane", f"{session_id}.salvage.patch")
+    if not cwd:
+        return {"salvage_patch": {"skipped": "no cwd recorded for this dispatch"}}
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, "status", "--porcelain"], capture_output=True, text=True, timeout=10
+        )
+    except Exception as exc:
+        return {"salvage_patch": {"skipped": f"git unavailable: {exc}"}}
+    if proc.returncode != 0:
+        return {"salvage_patch": {"skipped": f"cwd is not a git repo: {cwd}"}}
+    lines = [ln for ln in proc.stdout.splitlines() if not ln.strip().endswith(".hermes/")]
+    if not lines:
+        return {"salvage_patch": None}
+    diff = subprocess.run(
+        ["git", "-C", cwd, "diff", "HEAD"], capture_output=True, text=True, timeout=30
+    )
+    body = [diff.stdout] if diff.returncode == 0 and diff.stdout.strip() else []
+    for ln in lines:
+        if not ln.startswith("??"):
+            continue
+        rel = ln[3:].strip()
+        if rel.endswith("/"):
+            continue
+        try:
+            with open(os.path.join(cwd, rel), encoding="utf-8", errors="replace") as f:
+                content = f.read(1024 * 1024)
+        except OSError:
+            continue
+        body.append(f"--- /dev/null\n+++ /dev/null (untracked: {rel})\n{content}")
+    if not body:
+        body = ["(no tracked diff; changes are staged-only)\n"]
+    patch_text = "\n".join(body)[: 4 * 1024 * 1024]
+    patch_path = os.path.join(cwd, rel_patch)
+    try:
+        os.makedirs(os.path.dirname(patch_path), exist_ok=True)
+        with open(patch_path, "w") as f:
+            f.write(patch_text)
+    except OSError as exc:
+        return {"salvage_patch": {"skipped": f"cannot write patch: {exc}"}}
+    return {
+        "salvage_patch": patch_path,
+        "salvage_status": lines[0][:160],
+    }
+
+
 def _lane_lock_path(session_id):
     """Hold-point for one dispatch: <cwd>/.hermes/lane/LOCK/<session>.lock.
 
@@ -268,9 +322,21 @@ def _content_contains(path, needle):
 
 
 def _registry_write(
-    session_id, model, status, pid=None, exit_code=None, deliverable=None, require_sentinel=None
+    session_id,
+    model,
+    status,
+    pid=None,
+    exit_code=None,
+    deliverable=None,
+    require_sentinel=None,
+    salvage_patch=None,
+    salvage_status=None,
 ):
-    """Append/update the agent registry line. Never raises, never blocks dispatch."""
+    """Append/update the agent registry line. Never raises, never blocks dispatch.
+
+    salvage_patch/salvage_status: the terminal worktree snapshot fields written
+    by _salvage_snapshot on terminal-not-done exits (None = clean tree).
+    """
     try:
         import datetime
 
@@ -289,6 +355,10 @@ def _registry_write(
             entry["deliverable"] = deliverable
         if require_sentinel:
             entry["require_sentinel"] = require_sentinel
+        if salvage_patch is not None:
+            entry["salvage_patch"] = salvage_patch
+        if salvage_status is not None:
+            entry["salvage_status"] = salvage_status
         if status in ("done", "error", "killed", "timeout"):
             entry["finished"] = now
             _registry_update_running(session_id, entry)
@@ -1006,10 +1076,19 @@ def main(argv: list[str] | None = None) -> int:
             exit_code=exit_code,
             deliverable=_deliverable_verdict(sentinel_path, args.require_sentinel),
             require_sentinel=args.require_sentinel,
+            **_salvage_fields(status, args.session_id or "unnamed", args.cwd),
         )
         client.close()
         _lane_lock_release(args.session_id or "unnamed", args.cwd)
     return 0 if status == "done" else 3
+
+
+def _salvage_fields(status, session_id, cwd):
+    """Salvage registry fields for terminal-not-done exits (timeout, killed,
+    incomplete); done exits record nothing. Best-effort by construction."""
+    if status in ("done", "running"):
+        return {}
+    return _salvage_snapshot(session_id, cwd)
 
 
 if __name__ == "__main__":

@@ -657,6 +657,93 @@ exec sleep 60
             assert entry["exit_code"] == expect_rc
 
 
+class TestSalvagePatch:
+    """Terminal-not-done exits snapshot the dirty worktree into a size-capped
+    git diff patch, best-effort; a clean tree writes nothing."""
+
+    def _run_main_killed(self, tmp_path, monkeypatch, repo, fake_init_kwargs=None):
+        import pi_rpc_client as mod
+
+        real_init = mod.PiRpcClient.__init__
+
+        def fake_init(self, *a, **kw):
+            kw["proc_factory"] = lambda argv, **k: FakePiRpcProc(scripted_lines("ok"))
+            real_init(self, *a, **kw)
+
+        monkeypatch.setattr(mod.PiRpcClient, "__init__", fake_init)
+
+        def boom():
+            raise KeyboardInterrupt()
+
+        real_run = mod.PiRpcClient.run
+
+        def run_then_die(self, *a, **kw):
+            real_run(self, *a, **kw)
+            boom()
+
+        monkeypatch.setattr(mod.PiRpcClient, "run", run_then_die)
+        registry = tmp_path / "pi-agents.jsonl"
+        monkeypatch.setattr(mod, "REGISTRY_PATH", str(registry))
+        with pytest.raises(KeyboardInterrupt):
+            mod.main(
+                [
+                    "--session-id",
+                    "salvage-session",
+                    "--model",
+                    "m",
+                    "--prompt",
+                    "p",
+                    "--timeout",
+                    "30",
+                    "--min-tool-calls",
+                    "0",
+                    "--cwd",
+                    str(repo),
+                ]
+            )
+        with open(registry) as f:
+            entries = [json.loads(line) for line in f]
+        return [e for e in entries if e.get("status") not in ("running", None) or "finished" in e]
+
+    def _git_repo(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for args in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+            subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+        (repo / "f.txt").write_text("one\n")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True, capture_output=True
+        )
+        return repo
+
+    def test_killed_dirty_tree_writes_patch_with_registry_pointer(self, tmp_path, monkeypatch):
+        repo = self._git_repo(tmp_path)
+        (repo / "dirty.txt").write_text("uncommitted work\n")
+        terminal = self._run_main_killed(tmp_path, monkeypatch, repo)
+        patch_path = repo / ".hermes" / "lane" / "salvage-session.salvage.patch"
+        assert patch_path.is_file(), terminal
+        content = patch_path.read_text()
+        assert "dirty.txt" in content, content
+        entry = next(e for e in terminal if e.get("salvage_patch"))
+        assert entry["salvage_patch"] == str(patch_path), entry
+        assert "dirty.txt" in entry.get("salvage_status", ""), entry
+
+    def test_clean_tree_writes_no_patch(self, tmp_path, monkeypatch):
+        repo = self._git_repo(tmp_path)
+        terminal = self._run_main_killed(tmp_path, monkeypatch, repo)
+        assert not (repo / ".hermes" / "lane" / "salvage-session.salvage.patch").exists()
+        entry = next(e for e in terminal if e.get("status") == "killed")
+        assert entry.get("salvage_patch") is None, entry
+
+    def test_non_git_cwd_degrades_to_named_skip(self, tmp_path, monkeypatch):
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        terminal = self._run_main_killed(tmp_path, monkeypatch, plain)
+        entry = next(e for e in terminal if e.get("status") == "killed")
+        assert "not a git repo" in str(entry.get("salvage_patch")), entry
+
+
 class TestHeartbeatBudget:
     """A failed stamp never consumes the 5 s budget; the dir gets ensured."""
 
