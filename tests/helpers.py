@@ -8,8 +8,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import contextlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -101,6 +103,18 @@ def _spawn_real_client(tmpdir, session_id, cwd=None):
         stderr=subprocess.DEVNULL,
         env=env,
     )
+
+
+def _kill_dispatched(result):
+    """Kill a dispatched launch's whole process group. The launcher spawns with
+    start_new_session, so the wrapper pid leads a group holding the client."""
+    pid = result.get("pid")
+    if not isinstance(pid, int):
+        return
+    with contextlib.suppress(OSError):
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    with contextlib.suppress(ChildProcessError, OSError):
+        os.waitpid(pid, 0)
 
 
 def _wait_for_registry(fn, deadline=10):

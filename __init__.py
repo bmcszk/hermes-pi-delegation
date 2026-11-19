@@ -296,9 +296,10 @@ LAUNCH_PARAMS = {
     "auto": {
         "type": "boolean",
         "description": (
-            "run the generated command yourself as a detached background dispatch and "
-            "return dispatched/pid/session_id/log; default false keeps the paste-able "
-            "command output (no process spawned)"
+            "default true: dispatches the generated command as a detached background "
+            "worker and returns dispatched/pid/session_id/log with no command string; "
+            "false = diagnostic printout of the equivalent command, spawns nothing, "
+            "do NOT wait on the named session"
         ),
     },
     "create_anchor": {
@@ -1206,7 +1207,7 @@ def _verify_verdict(result, tree):
 
 
 def _dispatch_command(command, cwd, session_id):
-    """auto=true: run the generated one-liner detached, log to the lane dir.
+    """The default launch: run the generated one-liner detached, log to the lane dir.
 
     bash -c receives the EXACT emitted command (preflight echo + budget echo
     + client) with stdout/stderr into <cwd>/.hermes/lane/<session_id>.log;
@@ -1353,7 +1354,7 @@ def _compliance_block(skills):
 
 
 def pi_launch(args: dict, **_):
-    """Generate a pi worker launch command and report plugin freshness."""
+    """Dispatch a pi worker and report plugin freshness."""
     if not args.get("cwd"):
         return json.dumps({"error": "cwd is required (absolute project dir)"})
     return _call_impl("_pi_launch_impl", args)
@@ -1630,13 +1631,17 @@ def _pi_launch_impl(
     wall_timeout_s=None,
     require_sentinel=None,
     create_anchor=False,
-    auto=False,
+    auto=True,
     **_,
 ):
-    """Generate a single-line POSIX shell command for pi_rpc_client.py.
+    """Dispatch a pi worker as a detached background process.
 
-    The caller wraps the returned command in a Hermes terminal tool call with
-    background=true; the command itself is plain shell, no tool-DSL.
+    The default launch (auto absent, auto true) spawns the worker and returns
+    dispatched/pid/session_id/log; the answer carries no command string.
+
+    auto=false is the explicit diagnostic echo: it returns the equivalent
+    command and mode "echo-only", spawns nothing, and carries no wait hint -
+    never wait on the session an echo-only answer names.
 
     cwd is the required absolute project dir: pi is project-scoped (skill
     discovery and relative paths resolve from it).
@@ -1825,11 +1830,9 @@ def _pi_launch_impl(
     command += f' "$(cat {shlex.quote(contract_path)})"'
 
     result = {
-        "command": command,
         "session_id": session_id,
         "worker_type": worker_type,
         "mode": mode,
-        "next": f"pi_manage(action='wait', session_id='{session_id}', timeout_s<=1500)",
     }
     if require_sentinel:
         result["require_sentinel"] = require_sentinel
@@ -1840,6 +1843,14 @@ def _pi_launch_impl(
         )
     if auto:
         return _dispatch_command(command, cwd, session_id)
+    return _echo_answer(result, command, system_prompt, warnings)
+
+
+def _echo_answer(result, command, system_prompt, warnings):
+    """auto=false: the diagnostic printout, named as such and carrying no wait
+    hint - nothing was spawned, so no session exists to wait on."""
+    result["mode"] = "echo-only"
+    result["command"] = command
     if system_prompt is not None:
         result["system_prompt"] = system_prompt
     if warnings:
@@ -1907,7 +1918,7 @@ def on_pre_tool_call(tool_name, args, **_):
     """Parent-side enforcement ONLY.
 
     Worker-side tool calls never pass through Hermes hooks: workers run as
-    standalone python3 processes started from a pasted shell command. Worker
+    standalone python3 processes started outside this hook. Worker
     enforcement lives in sweep_runner.py and the contract text, not here.
     """
     if tool_name == "terminal":

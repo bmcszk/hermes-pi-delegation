@@ -14,6 +14,7 @@ from helpers import (
     CODING_RULES,
     CONTRACT_MD,
     TMP_CWD,
+    _kill_dispatched,
     _parse,
     _setup_registry,
     _spawn_real_client,
@@ -41,6 +42,19 @@ def _marked_project(dir_path=None, contract=True, anchor="a.go"):
 
 def _launch(payload):
     return _parse(pi_launch(payload))
+
+
+def _fake_pi_dispatch_env(tmp_path):
+    """A fake pi plus a launchable project: a dispatched client frames against it."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    fake_pi = bin_dir / "pi"
+    fake_pi.write_text(
+        "#!/bin/sh\nsleep 0.2\nprintf '%s\\n' '{\"type\":\"ready\"}'\nexec sleep 30\n"
+    )
+    fake_pi.chmod(0o755)
+    proj = _marked_project(str(tmp_path / "proj"))
+    return str(bin_dir), proj
 
 
 def _git_repo(tmpdir):
@@ -472,10 +486,12 @@ def test_pi_manage_recovery_pointer(action, expect_recovery):
         _cleanup_registry(tmpdir)
 
 
-def test_pi_launch_next_pointer():
-    """pi_launch (auto=false and auto=true) payload carries next naming wait
-    with the launched session id."""
-    proj = _marked_project()
+def test_pi_launch_next_pointer(tmp_path, monkeypatch):
+    """Only a dispatched launch carries the next wait hint; the echo answer
+    names its session without pointing a caller at a wait."""
+    bin_dir, proj = _fake_pi_dispatch_env(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("HOME", str(tmp_path))
     payload = {
         "worker_type": "coder",
         "model": "m",
@@ -485,17 +501,20 @@ def test_pi_launch_next_pointer():
         "epic_id": "epicNext",
     }
     result = _launch(payload)
-    assert "error" not in result, result
-    assert "next" in result, result
-    assert "wait" in result["next"], result
-    assert "epicNext-coder" in result["next"], result
+    try:
+        assert result.get("dispatched") is True, result
+        assert "next" in result, result
+        assert "wait" in result["next"], result
+        assert "epicNext-coder" in result["next"], result
+    finally:
+        _kill_dispatched(result)
 
-    # auto=true also carries next
-    payload["auto"] = True
-    result = _launch(payload)
-    assert "next" in result, result
-    assert "wait" in result["next"], result
-    assert "epicNext-coder" in result["next"], result
+    # the echo answer keeps its command and drops the hint entirely
+    result = _launch({**payload, "auto": False})
+    assert "error" not in result, result
+    assert result["mode"] == "echo-only", result
+    assert "next" not in result, result
+    assert "command" in result, result
 
 
 def test_handlers_match_framework_contract():
@@ -512,6 +531,7 @@ def test_handlers_match_framework_contract():
             "contract_path": CONTRACT_MD,
             "cwd": TMP_CWD,
             "epic_id": "epicContract",
+            "auto": False,
         }
     )
     assert isinstance(launch, str), launch
@@ -530,6 +550,7 @@ def test_handlers_match_framework_contract():
             "cwd": TMP_CWD,
             "epic_id": "e",
             "wat": True,
+            "auto": False,
         }
     )
     assert "error" not in json.loads(tolerant), tolerant

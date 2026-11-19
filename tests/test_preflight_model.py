@@ -31,6 +31,7 @@ def _launch(**over):
         "contract_path": CONTRACT_MD,
         "cwd": TMP_CWD,
         "epic_id": "epicMdl",
+        "auto": False,
     }
     return _parse(pi_launch({**payload, **over}))
 

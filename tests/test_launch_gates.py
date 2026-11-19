@@ -36,7 +36,11 @@ def _marked_project(dir_path=None, contract=True, anchor="a.go"):
 
 
 def _launch(payload):
-    return _parse(pi_launch(payload))
+    return _parse(pi_launch({**payload, "auto": False}))
+
+
+def _echo_launch(**payload):
+    return p._pi_launch_impl(**{**payload, "auto": False})
 
 
 def test_launch_schema_matches_impl_and_marks_required():
@@ -309,7 +313,7 @@ def test_launch_timeout_and_gate_flags(tmp_path):
         model="m",
         epic_id="epicTimeout",
     )
-    ok = p._pi_launch_impl(**base, timeout_s=123, require_edit=os.path.join(proj, "a.go"))
+    ok = _echo_launch(**base, timeout_s=123, require_edit=os.path.join(proj, "a.go"))
     assert "--timeout 123" in ok["command"], ok
     assert "--min-tool-calls 3" in ok["command"] and "--max-nudges 4" in ok["command"], ok
     # gates without a deliverable are refused
@@ -342,6 +346,7 @@ def test_budget_line_carries_resolved_numbers(cmd_over, tmp_path):
         model="m",
         epic_id="epicBudget",
         require_edit=[os.path.join(proj, "a.go")],
+        auto=False,
         **cmd_over,
     )
     assert "error" not in result, result

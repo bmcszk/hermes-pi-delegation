@@ -20,6 +20,7 @@ def _launch(**over):
         "cwd": TMP_CWD,
         "epic_id": "epicPlugin",
         "mode": "standard",
+        "auto": False,
         **over,
     }
     return _parse(pi_launch(payload))
@@ -30,7 +31,8 @@ def test_pi_launch_standard_coder(monkeypatch):
     assert "error" not in result, result
     assert result["session_id"] == "epicPlugin-coder"
     assert result["worker_type"] == "coder"
-    assert result["mode"] == "standard"
+    # the echo answer names its own mode: diagnostic printout, nothing spawned
+    assert result["mode"] == "echo-only"
     parts = shlex.split(result["command"])
     # the caller-supplied model alias lands 1:1 on the worker argv
     assert parts[parts.index("--model") + 1] == "anything"
@@ -90,6 +92,7 @@ def _launch_with_skill(skill, cwd):
                 "cwd": cwd,
                 "epic_id": "eS",
                 "mode": "standard",
+                "auto": False,
             }
         )
     )
@@ -224,6 +227,7 @@ def test_pi_launch_plugin_fresh_tracks_module_staleness(monkeypatch):
             model="anything",
             epic_id="eF2",
             mode="standard",
+            auto=False,
         )
     )
     assert "error" not in result, result

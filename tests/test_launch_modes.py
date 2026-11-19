@@ -1,18 +1,16 @@
 """Launch modes: the auditor deliverable toolset and the auto-dispatch gate
 (preflight failure spawns nothing)."""
 
-import contextlib
 import json
 import os
 import shlex
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
 
 import pytest
-from helpers import _parse, _wait_for_registry
+from helpers import _kill_dispatched, _parse, _wait_for_registry
 
 import __init__ as p
 from __init__ import pi_launch
@@ -51,7 +49,7 @@ def test_auditor_launch_contract(require_edit, expect):
         model="anything",
         epic_id="epicAuditor",
     )
-    result = _parse(p._pi_launch_impl(**{**base, **require_edit}))
+    result = _parse(p._pi_launch_impl(**{**base, **require_edit, "auto": False}))
     if expect == "ok":
         assert "error" not in result, result
         assert "--tools read,grep,find,ls,write,edit" in result["command"], result
@@ -203,13 +201,12 @@ def test_launch_auto_true_dispatches_and_registers(tmp_path, monkeypatch):
 
     row = _wait_for_registry(_row)
     assert row and row["status"] == "running", row
-    os.kill(result["pid"], signal.SIGTERM)
-    with contextlib.suppress(ChildProcessError):
-        # the launcher's child may already be reaped; SIGTERM still landed
-        os.waitpid(result["pid"], 0)
+    # the launcher detaches a whole process group: kill it, client included,
+    # so the next launch's pids never leak into later tests
+    _kill_dispatched(result)
 
     # auto=false prints the command only: no dispatch, no pid
-    result = _parse(pi_launch(_auto_launch_kwargs(bin_dir, proj)))
+    result = _parse(pi_launch({**_auto_launch_kwargs(bin_dir, proj), "auto": False}))
     assert "error" not in result, result
     assert "dispatched" not in result and "pid" not in result, result
     cmd = result["command"]
