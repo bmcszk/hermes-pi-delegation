@@ -312,6 +312,7 @@ LAUNCH_PARAMS = {
     },
     "worker_type": {
         "type": "string",
+        "enum": sorted(WORKER_TYPES),
         "description": (
             "optional, defaults to 'default' (passthrough: no tool/codemode/thinking "
             "policy attached). reasoner: read-only tools; brainer: read+write+edit, no "

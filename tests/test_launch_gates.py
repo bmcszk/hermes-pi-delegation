@@ -368,7 +368,7 @@ def test_budget_line_carries_resolved_numbers(cmd_over, tmp_path):
     shutil.rmtree(proj, ignore_errors=True)
 
 
-def _registered_manage_actions():
+def _registered_schemas():
     tools = {}
 
     class Ctx:
@@ -379,7 +379,12 @@ def _registered_manage_actions():
             tools[name] = schema
 
     p.register(Ctx())
-    return tools["pi_manage"]["parameters"]["properties"]["action"]["enum"]
+    return tools
+
+
+def _registered_manage_actions():
+    schema = _registered_schemas()["pi_manage"]
+    return schema["parameters"]["properties"]["action"]["enum"]
 
 
 def _stale_launch(monkeypatch, fresh_impl):
@@ -397,6 +402,27 @@ def _stale_launch(monkeypatch, fresh_impl):
             )
         )
     )
+
+
+def test_worker_type_schema_enum_lists_every_type():
+    # given
+    schema = _registered_schemas()["pi_launch"]
+    worker_type = schema["parameters"]["properties"]["worker_type"]
+
+    # then the closed set is offered at registration and derived, never literal
+    assert worker_type["enum"] == sorted(WORKER_TYPES)
+
+    # and the runtime rejection still guards a gateway holding a stale schema
+    result = p._pi_launch_impl(
+        worker_type="invented-type",
+        skills=[],
+        contract_path=_contract_file(),
+        cwd=os.getcwd(),
+        auto=False,
+    )
+    assert "Unknown worker_type: invented-type" in result["error"], result
+    for name in WORKER_TYPES:
+        assert name in result["error"], result
 
 
 def test_manage_doctor_and_launch_staleness(monkeypatch):
