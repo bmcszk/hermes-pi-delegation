@@ -717,3 +717,12 @@ def test_preflight_warns_coder_without_require_edit(worker_type, with_require_ed
     assert ("exit 0" in warnings and "require_edit" in warnings) is expect_warn, result.get(
         "warnings"
     )
+
+
+def test_manifest_carries_display_label_and_hermes_floor():
+    """The manifest names the plugin for humans and refuses a too-old core."""
+    manifest_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plugin.yaml")
+    with open(manifest_path) as f:
+        manifest = f.read()
+    assert "\nlabel: PI Delegation\n" in manifest
+    assert '\nrequires_hermes: ">=0.21.6"\n' in manifest
