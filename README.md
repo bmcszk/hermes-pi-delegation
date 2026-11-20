@@ -309,6 +309,22 @@ git binary and runs a mutating subcommand (`stash`, `reset`, `checkout`,
 `push --force`, `push -f`), the call is blocked. This is parent-side only;
 worker tool calls never pass through it.
 
+## Troubleshooting
+
+One row per symptom. Each cure is the section above that details it.
+
+| Symptom | Cause | Cure |
+| --- | --- | --- |
+| Launch fails with no `pi` found (pi missing from PATH) | the `pi` binary is absent from the parent `PATH` and the per-user install roots | Install roots and the `PATH` requirement are under [Install](#install). A launch that already ran answers through `pi_manage` `list`, which needs no `pi` binary. |
+| Tools are missing or the answer looks wrong after an edit (stale plugin / schema drift) | the gateway holds a module older than the file on disk, so the registered schema is behind | `pi_manage(action="doctor")` reports freshness and schema parity; the restart cure is in [`pi_manage`](#pi_manage) and [Development](#development). |
+| `wait` answers `status: never-dispatched` | a `pending-dispatch` row was recorded and no client process ever claimed it | Relaunch without `auto=false`; `pi_manage(action="kill")` clears the stale row. See [Fail-fast](#fail-fast-never-dispatched-and-unregistered-workers). |
+| `wait` answers `status: unregistered-client` | a live client process exists but never wrote its registry row | Same fail-fast section: the process is alive, so read its log via `pi_manage(action="logs")` before killing it. See [Fail-fast](#fail-fast-never-dispatched-and-unregistered-workers). |
+| Rows vanish from `list` and a warning mentions the registry (torn registry) | an unparseable record was quarantined instead of failing the read | Run the repair path in [The registry log](#the-registry-log-is-line-delimited-json-end-to-end); it keeps every parseable row and moves the corrupt lines aside. |
+| A lane refuses to run and `list` shows `lane_lock` (stale lane lock) | a crashed dispatch left `<cwd>/.hermes/lane/LOCK/<session_id>.lock` behind with a dead pid | [Lane locks](#lane-locks) reports the exact `rm` command; removal stays a human decision. |
+| `wait` answers `deliverable: unmet` | the sentinel string never reached the `require_edit` file, so the run is not a deliverable | [The sentinel pattern](#the-sentinel-pattern-a-call-count-is-not-a-deliverable) names the file to grep and the contract line to add. |
+| `exit 0` with residue | the client reported done while the tree still holds uncommitted or unpushed work | [`verify`](#verify-one-call-for-the-whole-exit-drill) re-checks the tree and answers `ok: false` naming what is left. |
+| `exit 3` over a clean tree | the correction budget ran out after the work had already landed | [`verify`](#verify-one-call-for-the-whole-exit-drill) answers `ok: true` for a committed, clean, pushed tree and names the contradiction. |
+
 ## Install
 
 ```sh

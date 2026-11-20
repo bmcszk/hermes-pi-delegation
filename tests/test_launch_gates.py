@@ -462,6 +462,50 @@ def test_manage_doctor_and_launch_staleness(monkeypatch):
     assert "warning" not in result, result
 
 
+TROUBLESHOOTING_MODES = [
+    "pi missing from PATH",
+    "stale plugin / schema drift",
+    "never-dispatched",
+    "unregistered-client",
+    "torn registry",
+    "stale lane lock",
+    "deliverable: unmet",
+    "exit 0 with residue",
+    "exit 3 over a clean tree",
+]
+
+
+def _readme_text():
+    readme_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "README.md")
+    with open(readme_path) as f:
+        return f.read()
+
+
+def _readme_section(readme, heading):
+    """Lines between `## <heading>` and the next level-2 heading."""
+    lines = readme.splitlines()
+    start = lines.index(f"## {heading}")
+    end = next(
+        (i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")),
+        len(lines),
+    )
+    return "\n".join(lines[start:end])
+
+
+def test_readme_troubleshooting_covers_named_failure_modes():
+    # given
+    readme = _readme_text()
+
+    # when
+    section = _readme_section(readme, "Troubleshooting").replace("`", "")
+
+    # then one consolidated place names every failure mode a parent can hit
+    missing = [mode for mode in TROUBLESHOOTING_MODES if mode not in section]
+    assert missing == [], missing
+    # and it sits with the tool docs, before the install steps
+    assert readme.index("## Troubleshooting") < readme.index("## Install")
+
+
 def test_readme_exit_code_table_covers_the_codes():
     readme_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "README.md")
     with open(readme_path) as f:
