@@ -102,6 +102,7 @@ def test_launch_manual_writes_pending_row():
             contract_path=helpers_contract(),
             cwd=helpers_cwd(),
             epic_id="epicPending",
+            auto=False,
         )
     )
     assert "error" not in result, result
@@ -125,6 +126,7 @@ def test_launch_relaunch_replaces_pending_row():
                 contract_path=helpers_contract(),
                 cwd=helpers_cwd(),
                 epic_id="epicPending",
+                auto=False,
             )
         )
         assert "error" not in result, result
@@ -146,6 +148,7 @@ def test_launch_pending_write_failure_degrades_to_warning():
                 contract_path=helpers_contract(),
                 cwd=helpers_cwd(),
                 epic_id="epicPending",
+                auto=False,
             )
         )
     finally:

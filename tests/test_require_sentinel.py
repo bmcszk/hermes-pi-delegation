@@ -58,6 +58,7 @@ def _sentinel_launch(tmp_path, require_edit=True, **over):
         "contract_path": str(proj / "contract.md"),
         "cwd": str(proj),
         "epic_id": "epicSent",
+        "auto": False,
         **over,
     }
     if require_edit:

@@ -36,7 +36,11 @@ def _marked_project(dir_path=None, contract=True, anchor="a.go"):
 
 
 def _launch(payload):
-    return _parse(pi_launch(payload))
+    return _parse(pi_launch({**payload, "auto": False}))
+
+
+def _echo_launch(**payload):
+    return p._pi_launch_impl(**{**payload, "auto": False})
 
 
 def test_launch_schema_matches_impl_and_marks_required():
@@ -309,7 +313,7 @@ def test_launch_timeout_and_gate_flags(tmp_path):
         model="m",
         epic_id="epicTimeout",
     )
-    ok = p._pi_launch_impl(**base, timeout_s=123, require_edit=os.path.join(proj, "a.go"))
+    ok = _echo_launch(**base, timeout_s=123, require_edit=os.path.join(proj, "a.go"))
     assert "--timeout 123" in ok["command"], ok
     assert "--min-tool-calls 3" in ok["command"] and "--max-nudges 4" in ok["command"], ok
     # gates without a deliverable are refused
@@ -342,6 +346,7 @@ def test_budget_line_carries_resolved_numbers(cmd_over, tmp_path):
         model="m",
         epic_id="epicBudget",
         require_edit=[os.path.join(proj, "a.go")],
+        auto=False,
         **cmd_over,
     )
     assert "error" not in result, result
@@ -363,7 +368,7 @@ def test_budget_line_carries_resolved_numbers(cmd_over, tmp_path):
     shutil.rmtree(proj, ignore_errors=True)
 
 
-def _registered_manage_actions():
+def _registered_schemas():
     tools = {}
 
     class Ctx:
@@ -374,7 +379,12 @@ def _registered_manage_actions():
             tools[name] = schema
 
     p.register(Ctx())
-    return tools["pi_manage"]["parameters"]["properties"]["action"]["enum"]
+    return tools
+
+
+def _registered_manage_actions():
+    schema = _registered_schemas()["pi_manage"]
+    return schema["parameters"]["properties"]["action"]["enum"]
 
 
 def _stale_launch(monkeypatch, fresh_impl):
@@ -392,6 +402,27 @@ def _stale_launch(monkeypatch, fresh_impl):
             )
         )
     )
+
+
+def test_worker_type_schema_enum_lists_every_type():
+    # given
+    schema = _registered_schemas()["pi_launch"]
+    worker_type = schema["parameters"]["properties"]["worker_type"]
+
+    # then the closed set is offered at registration and derived, never literal
+    assert worker_type["enum"] == sorted(WORKER_TYPES)
+
+    # and the runtime rejection still guards a gateway holding a stale schema
+    result = p._pi_launch_impl(
+        worker_type="invented-type",
+        skills=[],
+        contract_path=_contract_file(),
+        cwd=os.getcwd(),
+        auto=False,
+    )
+    assert "Unknown worker_type: invented-type" in result["error"], result
+    for name in WORKER_TYPES:
+        assert name in result["error"], result
 
 
 def test_manage_doctor_and_launch_staleness(monkeypatch):
@@ -429,6 +460,50 @@ def test_manage_doctor_and_launch_staleness(monkeypatch):
     assert result["plugin"]["stale"] is False
     assert result["plugin"]["hot_reloaded"] is True
     assert "warning" not in result, result
+
+
+TROUBLESHOOTING_MODES = [
+    "pi missing from PATH",
+    "stale plugin / schema drift",
+    "never-dispatched",
+    "unregistered-client",
+    "torn registry",
+    "stale lane lock",
+    "deliverable: unmet",
+    "exit 0 with residue",
+    "exit 3 over a clean tree",
+]
+
+
+def _readme_text():
+    readme_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "README.md")
+    with open(readme_path) as f:
+        return f.read()
+
+
+def _readme_section(readme, heading):
+    """Lines between `## <heading>` and the next level-2 heading."""
+    lines = readme.splitlines()
+    start = lines.index(f"## {heading}")
+    end = next(
+        (i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")),
+        len(lines),
+    )
+    return "\n".join(lines[start:end])
+
+
+def test_readme_troubleshooting_covers_named_failure_modes():
+    # given
+    readme = _readme_text()
+
+    # when
+    section = _readme_section(readme, "Troubleshooting").replace("`", "")
+
+    # then one consolidated place names every failure mode a parent can hit
+    missing = [mode for mode in TROUBLESHOOTING_MODES if mode not in section]
+    assert missing == [], missing
+    # and it sits with the tool docs, before the install steps
+    assert readme.index("## Troubleshooting") < readme.index("## Install")
 
 
 def test_readme_exit_code_table_covers_the_codes():
@@ -686,3 +761,12 @@ def test_preflight_warns_coder_without_require_edit(worker_type, with_require_ed
     assert ("exit 0" in warnings and "require_edit" in warnings) is expect_warn, result.get(
         "warnings"
     )
+
+
+def test_manifest_carries_display_label_and_hermes_floor():
+    """The manifest names the plugin for humans and refuses a too-old core."""
+    manifest_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plugin.yaml")
+    with open(manifest_path) as f:
+        manifest = f.read()
+    assert "\nlabel: PI Delegation\n" in manifest
+    assert '\nrequires_hermes: ">=0.21.6"\n' in manifest

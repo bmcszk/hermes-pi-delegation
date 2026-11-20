@@ -11,8 +11,9 @@ own `defaultModel`. Your Hermes skill supplies the aliases.
 
 ## Tools
 
-Both tools return JSON strings. `pi_launch` returns a single-line POSIX shell
-command; run it through your terminal tool with `background=true`.
+Both tools return JSON strings. `pi_launch` dispatches the worker itself by
+default (parameter `auto`, default `true`) and returns
+dispatched/pid/session_id/log.
 
 ### `pi_launch`
 
@@ -61,20 +62,22 @@ Worker types carry tool policy; what each is FOR and what its deliverable is:
 | `coder` | implementation work | edited files (nudge-gated) | pi defaults | yes | pi default |
 | `auditor` | review/triage jobs under the SAME registry and pi_manage surfaces (list, wait, kill, steer, logs via log_path, salvage_report) — runs as a real dispatch with a row, heartbeats and log_path. Go-to for text-deliverable jobs: the final assistant TEXT is the run's only observable output, so it is written into the first `require_edit` path at completion. The text lands on status done; a failed deliverable write downgrades to `incomplete` (exit 3). Full client-side tracking and management machinery work for it. | text written into the first `require_edit` path | `read,grep,find,ls,write,edit` | no | pi default |
 
-### One-shot dispatch (`auto=true`)
+### One-shot dispatch (the default)
 
-`pi_launch` accepted `auto`: with it, the launcher runs the generated
-command itself as a DETACHED background process (its own process group —
-the kill path stays exact) and returns
-`{dispatched: true, pid, session_id, log}` where `log` is
+`pi_launch` dispatches by default: `auto` is true unless you pass it, and the
+launcher runs the generated command itself as a DETACHED background process
+(its own process group — the kill path stays exact) and returns
+`{dispatched: true, pid, session_id, log, next}` where `log` is
 `<cwd>/.hermes/lane/<session_id>.log`, holding the worker's combined
-stdout+stderr (preflight + budget echoes included). The paste path
-(`auto=false`, the default) is unchanged: the command comes back as a
-string and NOTHING spawns. Preflight still runs FIRST either way — a
-preflight failure emits no process in both modes. Truth lives in the
-registry: `wait`/`list`/`kill` work on an auto-dispatched worker exactly
-like a pasted one, and the log file is the belt-and-suspenders view over
-`logs` (log_path).
+stdout+stderr (preflight + budget echoes included). The answer carries no
+command string: there is nothing to paste, and `next` names the `wait` call.
+Preflight runs FIRST: a preflight failure emits no process. Truth lives in the
+registry: `wait`/`list`/`kill` work on a dispatched worker like on any other
+run, and the log file is the belt-and-suspenders view over `logs` (log_path).
+
+`auto=false` is the explicit diagnostic echo mode: it returns the equivalent
+command with `mode: "echo-only"`, spawns nothing, and carries no `next` hint —
+nothing was dispatched, so do not wait on the session that answer names.
 
 ### `pi_manage`
 
@@ -113,11 +116,11 @@ A budget at or under 1500 s comes back unclamped (`clamped: false`, no hint).
 #### Fail-fast: never-dispatched and unregistered workers
 
 Every launch records a `pending-dispatch` intent row (mode manual or auto) in
-the registry; the auto dispatch stamps the spawned pid onto it. If a wait sees
+the registry; the dispatch stamps the spawned pid onto it. If a wait sees
 a pending row older than 25 s, it classifies immediately instead of burning
 its budget: with no client process for the session it answers
-`status: never-dispatched` (run the returned command, or launch with
-`auto=true`; `pi_manage(action='kill', ...)` clears the pending row); with a
+`status: never-dispatched` (relaunch without `auto=false`;
+`pi_manage(action='kill', ...)` clears the pending row); with a
 live client process that never registered it answers
 `status: unregistered-client`; with neither row nor process it answers
 `status: unknown` at once. A session id that matches no launch record and no
@@ -306,6 +309,22 @@ git binary and runs a mutating subcommand (`stash`, `reset`, `checkout`,
 `push --force`, `push -f`), the call is blocked. This is parent-side only;
 worker tool calls never pass through it.
 
+## Troubleshooting
+
+One row per symptom. Each cure is the section above that details it.
+
+| Symptom | Cause | Cure |
+| --- | --- | --- |
+| Launch fails with no `pi` found (pi missing from PATH) | the `pi` binary is absent from the parent `PATH` and the per-user install roots | Install roots and the `PATH` requirement are under [Install](#install). A launch that already ran answers through `pi_manage` `list`, which needs no `pi` binary. |
+| Tools are missing or the answer looks wrong after an edit (stale plugin / schema drift) | the gateway holds a module older than the file on disk, so the registered schema is behind | `pi_manage(action="doctor")` reports freshness and schema parity; the restart cure is in [`pi_manage`](#pi_manage) and [Development](#development). |
+| `wait` answers `status: never-dispatched` | a `pending-dispatch` row was recorded and no client process ever claimed it | Relaunch without `auto=false`; `pi_manage(action="kill")` clears the stale row. See [Fail-fast](#fail-fast-never-dispatched-and-unregistered-workers). |
+| `wait` answers `status: unregistered-client` | a live client process exists but never wrote its registry row | Same fail-fast section: the process is alive, so read its log via `pi_manage(action="logs")` before killing it. See [Fail-fast](#fail-fast-never-dispatched-and-unregistered-workers). |
+| Rows vanish from `list` and a warning mentions the registry (torn registry) | an unparseable record was quarantined instead of failing the read | Run the repair path in [The registry log](#the-registry-log-is-line-delimited-json-end-to-end); it keeps every parseable row and moves the corrupt lines aside. |
+| A lane refuses to run and `list` shows `lane_lock` (stale lane lock) | a crashed dispatch left `<cwd>/.hermes/lane/LOCK/<session_id>.lock` behind with a dead pid | [Lane locks](#lane-locks) reports the exact `rm` command; removal stays a human decision. |
+| `wait` answers `deliverable: unmet` | the sentinel string never reached the `require_edit` file, so the run is not a deliverable | [The sentinel pattern](#the-sentinel-pattern-a-call-count-is-not-a-deliverable) names the file to grep and the contract line to add. |
+| `exit 0` with residue | the client reported done while the tree still holds uncommitted or unpushed work | [`verify`](#verify-one-call-for-the-whole-exit-drill) re-checks the tree and answers `ok: false` naming what is left. |
+| `exit 3` over a clean tree | the correction budget ran out after the work had already landed | [`verify`](#verify-one-call-for-the-whole-exit-drill) answers `ok: true` for a committed, clean, pushed tree and names the contradiction. |
+
 ## Install
 
 ```sh
@@ -349,8 +368,7 @@ That line is your claim that the work is done.
 
 ```sh
 # If pi_launch is in your toolset:
-pi_launch(...)  # returns {command, session_id, next, ...}
-# Run the command through your terminal tool with background=true
+pi_launch(...)  # returns {dispatched: true, pid, session_id, log, next, ...}
 pi_manage(action="wait", session_id="task-hello-coder", timeout_s=1500)
 # Answers: {finished: true, status, exit_code, deliverable, tree, ...}
 # Check: deliverable == "met" AND tree.uncommitted_files == 0 AND tree.unpushed == 0

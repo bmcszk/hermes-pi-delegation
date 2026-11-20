@@ -296,9 +296,10 @@ LAUNCH_PARAMS = {
     "auto": {
         "type": "boolean",
         "description": (
-            "run the generated command yourself as a detached background dispatch and "
-            "return dispatched/pid/session_id/log; default false keeps the paste-able "
-            "command output (no process spawned)"
+            "default true: dispatches the generated command as a detached background "
+            "worker and returns dispatched/pid/session_id/log with no command string; "
+            "false = diagnostic printout of the equivalent command, spawns nothing, "
+            "do NOT wait on the named session"
         ),
     },
     "create_anchor": {
@@ -311,6 +312,7 @@ LAUNCH_PARAMS = {
     },
     "worker_type": {
         "type": "string",
+        "enum": sorted(WORKER_TYPES),
         "description": (
             "optional, defaults to 'default' (passthrough: no tool/codemode/thinking "
             "policy attached). reasoner: read-only tools; brainer: read+write+edit, no "
@@ -466,81 +468,103 @@ def _fresh_impl(name):
     return getattr(module, name)
 
 
+def _manage_properties():
+    return {
+        "action": {
+            "type": "string",
+            "enum": [
+                "list",
+                "kill",
+                "doctor",
+                "logs",
+                "wait",
+                "steer",
+                "salvage_report",
+                "verify",
+            ],
+        },
+        "session_id": {"type": "string"},
+        "message": {
+            "type": "string",
+            "description": "steer: text injected into the worker",
+        },
+        "queue": {
+            "type": "boolean",
+            "description": (
+                "steer: true queues the message for the worker's next turn "
+                "(follow_up) instead of the current run"
+            ),
+        },
+        "only_running": {"type": "boolean"},
+        "lines": {"type": "integer", "minimum": 1},
+        "timeout_s": {
+            "type": "integer",
+            "minimum": 0,
+            "description": (
+                "wait: seconds to keep probing; 0 means a single probe. "
+                "Clamped to 1500s (WAIT_CEILING_S), safely under the host's "
+                "1600s tool-call ceiling; a clamped answer carries "
+                "clamped/resumed_by=call-wait-again"
+            ),
+        },
+        "poll_s": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "wait: seconds between probes",
+        },
+        "go_tests": {
+            "type": "boolean",
+            "description": (
+                "salvage_report: for a recorded cwd with go.mod, also run "
+                "'go test ./...' (off by default: it dominates the report's runtime)"
+            ),
+        },
+    }
+
+
+def _manage_schema():
+    return _tool_schema(
+        "pi_manage",
+        "List, steer or kill pi subagent sessions",
+        _manage_properties(),
+        ["action"],
+    )
+
+
+def _launch_schema():
+    return _tool_schema(
+        "pi_launch",
+        "Generate a launch command for a pi subagent worker",
+        _launch_properties(),
+        _launch_required(),
+    )
+
+
+def _register_guarded(ctx, name, toolset, build_schema, handler):
+    """Register one tool; a schema failure costs its own tool, not the others."""
+    try:
+        ctx.register_tool(name=name, toolset=toolset, schema=build_schema(), handler=handler)
+    except Exception as exc:  # the surviving tools are the diagnostic surface
+        logging.warning(
+            "pi-delegation: %s registration failed (%s); the other tools still work",
+            name,
+            exc,
+        )
+        return False
+    return True
+
+
 def register(ctx):
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
-    ctx.register_tool(
-        name="pi_manage",
-        toolset=TOOLSETS["pi_manage"],
-        schema=_tool_schema(
-            "pi_manage",
-            "List, steer or kill pi subagent sessions",
-            {
-                "action": {
-                    "type": "string",
-                    "enum": [
-                        "list",
-                        "kill",
-                        "doctor",
-                        "logs",
-                        "wait",
-                        "steer",
-                        "salvage_report",
-                        "verify",
-                    ],
-                },
-                "session_id": {"type": "string"},
-                "message": {
-                    "type": "string",
-                    "description": "steer: text injected into the worker",
-                },
-                "queue": {
-                    "type": "boolean",
-                    "description": (
-                        "steer: true queues the message for the worker's next turn "
-                        "(follow_up) instead of the current run"
-                    ),
-                },
-                "only_running": {"type": "boolean"},
-                "lines": {"type": "integer", "minimum": 1},
-                "timeout_s": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": (
-                        "wait: seconds to keep probing; 0 means a single probe. "
-                        "Clamped to 1500s (WAIT_CEILING_S), safely under the host's "
-                        "1600s tool-call ceiling; a clamped answer carries "
-                        "clamped/resumed_by=call-wait-again"
-                    ),
-                },
-                "poll_s": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "wait: seconds between probes",
-                },
-                "go_tests": {
-                    "type": "boolean",
-                    "description": (
-                        "salvage_report: for a recorded cwd with go.mod, also run "
-                        "'go test ./...' (off by default: it dominates the report's runtime)"
-                    ),
-                },
-            },
-            ["action"],
-        ),
-        handler=pi_manage,
-    )
-    ctx.register_tool(
-        name="pi_launch",
-        toolset=TOOLSETS["pi_launch"],
-        schema=_tool_schema(
-            "pi_launch",
-            "Generate a launch command for a pi subagent worker",
-            _launch_properties(),
-            _launch_required(),
-        ),
-        handler=pi_launch,
-    )
-    logging.info("pi-delegation plugin registered with management tools")
+    registered = [
+        name
+        for name, toolset, build_schema, handler in (
+            ("pi_manage", TOOLSETS["pi_manage"], _manage_schema, pi_manage),
+            ("pi_launch", TOOLSETS["pi_launch"], _launch_schema, pi_launch),
+        )
+        if _register_guarded(ctx, name, toolset, build_schema, handler)
+    ]
+    logging.info("pi-delegation plugin registered: %s", ", ".join(registered) or "none")
 
 
 def _call_impl(name, args):
@@ -1206,7 +1230,7 @@ def _verify_verdict(result, tree):
 
 
 def _dispatch_command(command, cwd, session_id):
-    """auto=true: run the generated one-liner detached, log to the lane dir.
+    """The default launch: run the generated one-liner detached, log to the lane dir.
 
     bash -c receives the EXACT emitted command (preflight echo + budget echo
     + client) with stdout/stderr into <cwd>/.hermes/lane/<session_id>.log;
@@ -1353,7 +1377,7 @@ def _compliance_block(skills):
 
 
 def pi_launch(args: dict, **_):
-    """Generate a pi worker launch command and report plugin freshness."""
+    """Dispatch a pi worker and report plugin freshness."""
     if not args.get("cwd"):
         return json.dumps({"error": "cwd is required (absolute project dir)"})
     return _call_impl("_pi_launch_impl", args)
@@ -1630,13 +1654,17 @@ def _pi_launch_impl(
     wall_timeout_s=None,
     require_sentinel=None,
     create_anchor=False,
-    auto=False,
+    auto=True,
     **_,
 ):
-    """Generate a single-line POSIX shell command for pi_rpc_client.py.
+    """Dispatch a pi worker as a detached background process.
 
-    The caller wraps the returned command in a Hermes terminal tool call with
-    background=true; the command itself is plain shell, no tool-DSL.
+    The default launch (auto absent, auto true) spawns the worker and returns
+    dispatched/pid/session_id/log; the answer carries no command string.
+
+    auto=false is the explicit diagnostic echo: it returns the equivalent
+    command and mode "echo-only", spawns nothing, and carries no wait hint -
+    never wait on the session an echo-only answer names.
 
     cwd is the required absolute project dir: pi is project-scoped (skill
     discovery and relative paths resolve from it).
@@ -1825,11 +1853,9 @@ def _pi_launch_impl(
     command += f' "$(cat {shlex.quote(contract_path)})"'
 
     result = {
-        "command": command,
         "session_id": session_id,
         "worker_type": worker_type,
         "mode": mode,
-        "next": f"pi_manage(action='wait', session_id='{session_id}', timeout_s<=1500)",
     }
     if require_sentinel:
         result["require_sentinel"] = require_sentinel
@@ -1840,6 +1866,14 @@ def _pi_launch_impl(
         )
     if auto:
         return _dispatch_command(command, cwd, session_id)
+    return _echo_answer(result, command, system_prompt, warnings)
+
+
+def _echo_answer(result, command, system_prompt, warnings):
+    """auto=false: the diagnostic printout, named as such and carrying no wait
+    hint - nothing was spawned, so no session exists to wait on."""
+    result["mode"] = "echo-only"
+    result["command"] = command
     if system_prompt is not None:
         result["system_prompt"] = system_prompt
     if warnings:
@@ -1907,7 +1941,7 @@ def on_pre_tool_call(tool_name, args, **_):
     """Parent-side enforcement ONLY.
 
     Worker-side tool calls never pass through Hermes hooks: workers run as
-    standalone python3 processes started from a pasted shell command. Worker
+    standalone python3 processes started outside this hook. Worker
     enforcement lives in sweep_runner.py and the contract text, not here.
     """
     if tool_name == "terminal":
