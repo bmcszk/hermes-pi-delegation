@@ -467,81 +467,103 @@ def _fresh_impl(name):
     return getattr(module, name)
 
 
+def _manage_properties():
+    return {
+        "action": {
+            "type": "string",
+            "enum": [
+                "list",
+                "kill",
+                "doctor",
+                "logs",
+                "wait",
+                "steer",
+                "salvage_report",
+                "verify",
+            ],
+        },
+        "session_id": {"type": "string"},
+        "message": {
+            "type": "string",
+            "description": "steer: text injected into the worker",
+        },
+        "queue": {
+            "type": "boolean",
+            "description": (
+                "steer: true queues the message for the worker's next turn "
+                "(follow_up) instead of the current run"
+            ),
+        },
+        "only_running": {"type": "boolean"},
+        "lines": {"type": "integer", "minimum": 1},
+        "timeout_s": {
+            "type": "integer",
+            "minimum": 0,
+            "description": (
+                "wait: seconds to keep probing; 0 means a single probe. "
+                "Clamped to 1500s (WAIT_CEILING_S), safely under the host's "
+                "1600s tool-call ceiling; a clamped answer carries "
+                "clamped/resumed_by=call-wait-again"
+            ),
+        },
+        "poll_s": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "wait: seconds between probes",
+        },
+        "go_tests": {
+            "type": "boolean",
+            "description": (
+                "salvage_report: for a recorded cwd with go.mod, also run "
+                "'go test ./...' (off by default: it dominates the report's runtime)"
+            ),
+        },
+    }
+
+
+def _manage_schema():
+    return _tool_schema(
+        "pi_manage",
+        "List, steer or kill pi subagent sessions",
+        _manage_properties(),
+        ["action"],
+    )
+
+
+def _launch_schema():
+    return _tool_schema(
+        "pi_launch",
+        "Generate a launch command for a pi subagent worker",
+        _launch_properties(),
+        _launch_required(),
+    )
+
+
+def _register_guarded(ctx, name, toolset, build_schema, handler):
+    """Register one tool; a schema failure costs its own tool, not the others."""
+    try:
+        ctx.register_tool(name=name, toolset=toolset, schema=build_schema(), handler=handler)
+    except Exception as exc:  # the surviving tools are the diagnostic surface
+        logging.warning(
+            "pi-delegation: %s registration failed (%s); the other tools still work",
+            name,
+            exc,
+        )
+        return False
+    return True
+
+
 def register(ctx):
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
-    ctx.register_tool(
-        name="pi_manage",
-        toolset=TOOLSETS["pi_manage"],
-        schema=_tool_schema(
-            "pi_manage",
-            "List, steer or kill pi subagent sessions",
-            {
-                "action": {
-                    "type": "string",
-                    "enum": [
-                        "list",
-                        "kill",
-                        "doctor",
-                        "logs",
-                        "wait",
-                        "steer",
-                        "salvage_report",
-                        "verify",
-                    ],
-                },
-                "session_id": {"type": "string"},
-                "message": {
-                    "type": "string",
-                    "description": "steer: text injected into the worker",
-                },
-                "queue": {
-                    "type": "boolean",
-                    "description": (
-                        "steer: true queues the message for the worker's next turn "
-                        "(follow_up) instead of the current run"
-                    ),
-                },
-                "only_running": {"type": "boolean"},
-                "lines": {"type": "integer", "minimum": 1},
-                "timeout_s": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": (
-                        "wait: seconds to keep probing; 0 means a single probe. "
-                        "Clamped to 1500s (WAIT_CEILING_S), safely under the host's "
-                        "1600s tool-call ceiling; a clamped answer carries "
-                        "clamped/resumed_by=call-wait-again"
-                    ),
-                },
-                "poll_s": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "wait: seconds between probes",
-                },
-                "go_tests": {
-                    "type": "boolean",
-                    "description": (
-                        "salvage_report: for a recorded cwd with go.mod, also run "
-                        "'go test ./...' (off by default: it dominates the report's runtime)"
-                    ),
-                },
-            },
-            ["action"],
-        ),
-        handler=pi_manage,
-    )
-    ctx.register_tool(
-        name="pi_launch",
-        toolset=TOOLSETS["pi_launch"],
-        schema=_tool_schema(
-            "pi_launch",
-            "Generate a launch command for a pi subagent worker",
-            _launch_properties(),
-            _launch_required(),
-        ),
-        handler=pi_launch,
-    )
-    logging.info("pi-delegation plugin registered with management tools")
+    registered = [
+        name
+        for name, toolset, build_schema, handler in (
+            ("pi_manage", TOOLSETS["pi_manage"], _manage_schema, pi_manage),
+            ("pi_launch", TOOLSETS["pi_launch"], _launch_schema, pi_launch),
+        )
+        if _register_guarded(ctx, name, toolset, build_schema, handler)
+    ]
+    logging.info("pi-delegation plugin registered: %s", ", ".join(registered) or "none")
 
 
 def _call_impl(name, args):

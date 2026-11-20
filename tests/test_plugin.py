@@ -1,6 +1,7 @@
 """pi_launch command generation: worker toolsets, skill resolution, compliance
 block, prompt substitution, and the plugin-fresh flag."""
 
+import logging
 import os
 import shlex
 
@@ -232,3 +233,32 @@ def test_pi_launch_plugin_fresh_tracks_module_staleness(monkeypatch):
     )
     assert "error" not in result, result
     assert "--plugin-fresh" not in shlex.split(result["command"])
+
+
+def test_register_isolates_tool_failures(monkeypatch, caplog):
+    """A launch-side schema failure must not take the control plane down."""
+    # given
+    registered = {}
+
+    class RecordingCtx:
+        def register_hook(self, *a, **k):
+            pass
+
+        def register_tool(self, name, toolset, schema, handler):
+            registered[name] = schema
+
+    def boom():
+        raise RuntimeError("schema build broke")
+
+    monkeypatch.setattr(p, "_launch_properties", boom)
+
+    # when
+    with caplog.at_level(logging.WARNING):
+        p.register(RecordingCtx())
+
+    # then
+    assert "pi_manage" in registered
+    assert "pi_launch" not in registered
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, warnings
+    assert "pi_launch" in warnings[0], warnings
