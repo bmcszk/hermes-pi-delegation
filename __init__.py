@@ -402,6 +402,47 @@ LAUNCH_PARAMS = {
 }
 
 
+_SLUG_PREVIEW_CAP = 32
+
+
+def _import_agent_display():
+    """Return the host's agent.display module, or raise when absent."""
+    from agent import display
+
+    return display
+
+
+def _preview_launch(args, max_len):
+    """Compose the pi_launch progress-bubble label; never raises.
+
+    Shape: <slug cap 32> · <worker_type> · <model when set> · "codemode" when
+    the worker_type policy enables it · "echo-only" when mode != standard.
+    """
+    try:
+        parts = [str(args.get("task_slug") or "")[:_SLUG_PREVIEW_CAP]]
+        worker_type = str(args.get("worker_type") or "")
+        parts.append(worker_type)
+        model = str(args.get("model") or "")
+        if model:
+            parts.append(model)
+        if WORKER_TYPES.get(worker_type, {}).get("use_codemode"):
+            parts.append("codemode")
+        if args.get("mode", "standard") != "standard":
+            parts.append("echo-only")
+        return " · ".join(part for part in parts if part)
+    except Exception:
+        return None
+
+
+def _register_display_preview():
+    """Teach agent.display to render pi_launch bubbles; degrade with a warning
+    when the display module is absent or its shape differs."""
+    display = _import_agent_display()
+    display._PREVIEW_BUILDERS["pi_launch"] = _preview_launch
+    display._PRIMARY_ARGS["pi_launch"] = "worker_type"
+    logging.info("pi-delegation: display preview registered for pi_launch")
+
+
 def _launch_properties():
     return LAUNCH_PARAMS
 
@@ -565,6 +606,10 @@ def register(ctx):
         if _register_guarded(ctx, name, toolset, build_schema, handler)
     ]
     logging.info("pi-delegation plugin registered: %s", ", ".join(registered) or "none")
+    try:
+        _register_display_preview()
+    except Exception as exc:
+        logging.warning("pi-delegation: display preview registration skipped (%s)", exc)
 
 
 def _call_impl(name, args):
