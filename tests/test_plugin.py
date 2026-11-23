@@ -350,6 +350,74 @@ def test_launch_preview_caps_the_slug(monkeypatch):
     assert label == "x" * 32 + " · coder · codemode"
 
 
+def _registered_manage_preview_builder(monkeypatch):
+    """Return the pi_manage builder the way agent.display would look it up."""
+
+    class Ctx:
+        def register_hook(self, *a, **k):
+            pass
+
+        def register_tool(self, *a, **k):
+            pass
+
+    display_mod = _seed_fake_display(monkeypatch)
+    p.register(Ctx())
+    assert "pi_manage" in display_mod._PREVIEW_BUILDERS
+
+    return display_mod._PREVIEW_BUILDERS["pi_manage"]
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        pytest.param({"action": "list"}, "list", id="list"),
+        pytest.param(
+            {"action": "wait", "session_id": "task-hard9b-coder", "timeout_s": 300},
+            "wait · task-hard9b-coder · t 300",
+            id="wait-session-timeout",
+        ),
+        pytest.param(
+            {"action": "kill", "session_id": "phantom-never-ran"},
+            "kill · phantom-never-ran",
+            id="kill-session",
+        ),
+        pytest.param(
+            {"action": "steer", "session_id": "task-x", "prompt": "rerun gates"},
+            "steer · task-x · +prompt",
+            id="steer-with-prompt",
+        ),
+        pytest.param(
+            {"action": "steer", "session_id": "task-x"},
+            "steer · task-x · +empty",
+            id="steer-without-prompt",
+        ),
+    ],
+)
+def test_manage_preview_labels_the_call(monkeypatch, args, expected):
+    # when
+    label = _registered_manage_preview_builder(monkeypatch)(args, 200)
+
+    # then
+    assert label == expected
+
+
+def test_manage_preview_survives_unknown_or_absent_action(monkeypatch):
+    # when / then
+    builder = _registered_manage_preview_builder(monkeypatch)
+    assert builder({"session_id": "task-x"}, 200) == "manage"
+    assert builder({"action": "explode"}, 200) == "manage"
+
+
+def test_manage_preview_caps_the_session_id(monkeypatch):
+    # when
+    label = _registered_manage_preview_builder(monkeypatch)(
+        {"action": "kill", "session_id": "y" * 50}, 200
+    )
+
+    # then
+    assert label == "kill · " + "y" * 32
+
+
 def test_display_registration_degrades_without_display_module(monkeypatch, caplog):
     # given
     registered = {}

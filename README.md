@@ -20,6 +20,11 @@ In the tool-progress bubble, `pi_launch` renders as
 ` · codemode` when the worker type enables codemode, and ` · echo-only`
 when the dispatch is the diagnostic mode.
 
+In the tool-progress bubble, `pi_manage` renders as `<action>` plus
+` · <session_id>` (capped at 32 chars) when set, ` · t <timeout_s>` when
+`action=wait` sets a timeout, and ` · +prompt` / ` · +empty` when steering
+(surfacing a steer call with no prompt text).
+
 ### `pi_launch`
 
 Generates one worker dispatch.
