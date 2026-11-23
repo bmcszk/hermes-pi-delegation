@@ -251,6 +251,7 @@ def test_register_isolates_tool_failures(monkeypatch, caplog):
         raise RuntimeError("schema build broke")
 
     monkeypatch.setattr(p, "_launch_properties", boom)
+    _seed_fake_display(monkeypatch)
 
     # when
     with caplog.at_level(logging.WARNING):
@@ -262,3 +263,182 @@ def test_register_isolates_tool_failures(monkeypatch, caplog):
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1, warnings
     assert "pi_launch" in warnings[0], warnings
+
+
+def _seed_fake_display(monkeypatch):
+    """Install a stand-in agent.display so register() patches a throwaway module
+    instead of requiring, and mutating, the host's real one."""
+    import sys
+    import types
+
+    display_mod = types.ModuleType("agent.display")
+    display_mod._PREVIEW_BUILDERS = {}
+    display_mod._PRIMARY_ARGS = {}
+    agent_mod = types.ModuleType("agent")
+    agent_mod.display = display_mod
+    monkeypatch.setitem(sys.modules, "agent", agent_mod)
+    monkeypatch.setitem(sys.modules, "agent.display", display_mod)
+    return display_mod
+
+
+def _registered_preview_builder(monkeypatch):
+    """Return the pi_launch builder the way agent.display would look it up."""
+
+    class Ctx:
+        def register_hook(self, *a, **k):
+            pass
+
+        def register_tool(self, *a, **k):
+            pass
+
+    display_mod = _seed_fake_display(monkeypatch)
+    p.register(Ctx())
+    assert "pi_launch" in display_mod._PREVIEW_BUILDERS
+
+    return display_mod._PREVIEW_BUILDERS["pi_launch"]
+
+
+@pytest.mark.parametrize(
+    ("over", "expected_tail"),
+    [
+        pytest.param(
+            {"worker_type": "coder"},
+            "hard9-bubble · coder · codemode",
+            id="codemode-type",
+        ),
+        pytest.param(
+            {"worker_type": "coder", "model": "fast"},
+            "hard9-bubble · coder · fast · codemode",
+            id="model-set",
+        ),
+        pytest.param(
+            {"worker_type": "brainer"},
+            "hard9-bubble · brainer",
+            id="no-codemode",
+        ),
+        pytest.param(
+            {"worker_type": "brainer", "mode": "echo-only"},
+            "hard9-bubble · brainer · echo-only",
+            id="echo-only",
+        ),
+        pytest.param(
+            {"worker_type": "mystery", "model": "fast"},
+            "hard9-bubble · mystery · fast",
+            id="unknown-worker-type-falls-back",
+        ),
+    ],
+)
+def test_launch_preview_labels_the_dispatch(monkeypatch, over, expected_tail):
+    # given
+    args = {"task_slug": "hard9-bubble", "mode": "standard", **over}
+
+    # when
+    label = _registered_preview_builder(monkeypatch)(args, 200)
+
+    # then
+    assert label == expected_tail
+
+
+def test_launch_preview_caps_the_slug(monkeypatch):
+    # given
+    args = {"task_slug": "x" * 50, "worker_type": "coder"}
+
+    # when
+    label = _registered_preview_builder(monkeypatch)(args, 200)
+
+    # then
+    assert label == "x" * 32 + " · coder · codemode"
+
+
+def _registered_manage_preview_builder(monkeypatch):
+    """Return the pi_manage builder the way agent.display would look it up."""
+
+    class Ctx:
+        def register_hook(self, *a, **k):
+            pass
+
+        def register_tool(self, *a, **k):
+            pass
+
+    display_mod = _seed_fake_display(monkeypatch)
+    p.register(Ctx())
+    assert "pi_manage" in display_mod._PREVIEW_BUILDERS
+
+    return display_mod._PREVIEW_BUILDERS["pi_manage"]
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        pytest.param({"action": "list"}, "list", id="list"),
+        pytest.param(
+            {"action": "wait", "session_id": "task-hard9b-coder", "timeout_s": 300},
+            "wait · task-hard9b-coder · t 300",
+            id="wait-session-timeout",
+        ),
+        pytest.param(
+            {"action": "kill", "session_id": "phantom-never-ran"},
+            "kill · phantom-never-ran",
+            id="kill-session",
+        ),
+        pytest.param(
+            {"action": "steer", "session_id": "task-x", "prompt": "rerun gates"},
+            "steer · task-x · +prompt",
+            id="steer-with-prompt",
+        ),
+        pytest.param(
+            {"action": "steer", "session_id": "task-x"},
+            "steer · task-x · +empty",
+            id="steer-without-prompt",
+        ),
+    ],
+)
+def test_manage_preview_labels_the_call(monkeypatch, args, expected):
+    # when
+    label = _registered_manage_preview_builder(monkeypatch)(args, 200)
+
+    # then
+    assert label == expected
+
+
+def test_manage_preview_survives_unknown_or_absent_action(monkeypatch):
+    # when / then
+    builder = _registered_manage_preview_builder(monkeypatch)
+    assert builder({"session_id": "task-x"}, 200) == "manage"
+    assert builder({"action": "explode"}, 200) == "manage"
+
+
+def test_manage_preview_caps_the_session_id(monkeypatch):
+    # when
+    label = _registered_manage_preview_builder(monkeypatch)(
+        {"action": "kill", "session_id": "y" * 50}, 200
+    )
+
+    # then
+    assert label == "kill · " + "y" * 32
+
+
+def test_display_registration_degrades_without_display_module(monkeypatch, caplog):
+    # given
+    registered = {}
+
+    class RecordingCtx:
+        def register_hook(self, *a, **k):
+            pass
+
+        def register_tool(self, name, toolset, schema, handler):
+            registered[name] = schema
+
+    def import_boom():
+        raise ImportError("no agent.display here")
+
+    monkeypatch.setattr(p, "_import_agent_display", import_boom)
+
+    # when
+    with caplog.at_level(logging.WARNING):
+        p.register(RecordingCtx())
+
+    # then
+    assert sorted(registered) == ["pi_launch", "pi_manage"]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("display preview registration skipped" in w for w in warnings)

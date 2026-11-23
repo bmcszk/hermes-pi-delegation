@@ -15,6 +15,16 @@ Both tools return JSON strings. `pi_launch` dispatches the worker itself by
 default (parameter `auto`, default `true`) and returns
 dispatched/pid/session_id/log.
 
+In the tool-progress bubble, `pi_launch` renders as
+`<task_slug cap 32> · <worker_type>` plus ` · <model>` when set,
+` · codemode` when the worker type enables codemode, and ` · echo-only`
+when the dispatch is the diagnostic mode.
+
+In the tool-progress bubble, `pi_manage` renders as `<action>` plus
+` · <session_id>` (capped at 32 chars) when set, ` · t <timeout_s>` when
+`action=wait` sets a timeout, and ` · +prompt` / ` · +empty` when steering
+(surfacing a steer call with no prompt text).
+
 ### `pi_launch`
 
 Generates one worker dispatch.
