@@ -1899,6 +1899,18 @@ def _pi_launch_impl(
         ]
         return {"error": "preflight: " + "; ".join(failures)}
     parts.extend(["--wall-timeout", str(resolved_wall)])
+    if timeout_s is None:
+        timeout_source = (
+            "PI_WORKER_TIMEOUT_S" if "PI_WORKER_TIMEOUT_S" in os.environ else "built-in default"
+        )
+        warnings.append(
+            f"budget warn: timeout_s not set - defaulting to {resolved_timeout}s ({timeout_source})"
+        )
+    if wall_timeout_s is None:
+        warnings.append(
+            f"budget warn: wall_timeout_s not set - defaulting to {resolved_wall}s "
+            "(max(3600, timeout_s + 900))"
+        )
 
     if require_edit:
         targets = require_edit if isinstance(require_edit, str) else ",".join(require_edit)
@@ -1908,6 +1920,7 @@ def _pi_launch_impl(
         else:
             min_calls = 3 if min_tool_calls is _UNSET else int(min_tool_calls)
             max_nudges_resolved = 4 if max_nudges is _UNSET else int(max_nudges)
+        nudge_gate_off = min_tool_calls is _UNSET and max_nudges is _UNSET
         nudge_clause = (
             "nudge: 0 - no correction loop"
             if max_nudges_resolved == 0
@@ -1916,6 +1929,10 @@ def _pi_launch_impl(
         parts.extend(["--require-edit", targets])
         parts.extend(["--min-tool-calls", str(min_calls)])
         parts.extend(["--max-nudges", str(max_nudges_resolved)])
+        if nudge_gate_off:
+            warnings.append(
+                f"budget warn: min_tool_calls/max_nudges not set - nudge gate off ({nudge_clause})"
+            )
         if require_sentinel:
             parts.extend(["--require-sentinel", require_sentinel])
     else:

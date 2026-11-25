@@ -770,3 +770,74 @@ def test_manifest_carries_display_label_and_hermes_floor():
         manifest = f.read()
     assert "\nlabel: PI Delegation\n" in manifest
     assert '\nrequires_hermes: ">=0.21.6"\n' in manifest
+
+
+# given the world from the autouse fixture, a launch with unset budgets
+def _budget_launch(**over):
+    proj = _marked_project()
+    try:
+        return p._pi_launch_impl(
+            worker_type="coder",
+            skills=[],
+            contract_path=os.path.join(proj, "contract.md"),
+            cwd=proj,
+            epic_id="epicBudgetWarn",
+            require_edit=[os.path.join(proj, "a.go")],
+            auto=False,
+            **over,
+        )
+    finally:
+        shutil.rmtree(proj, ignore_errors=True)
+
+
+def test_budget_fallback_warnings_name_the_resolved_default(monkeypatch):
+    # unset timeout_s falls back to the built-in 900s default and says so
+    monkeypatch.delenv("PI_WORKER_TIMEOUT_S", raising=False)
+    result = _budget_launch()
+    assert "budget warn: timeout_s not set - defaulting to 900s (built-in default)" in (
+        result.get("warnings") or []
+    ), result.get("warnings")
+
+    # unset timeout_s with PI_WORKER_TIMEOUT_S set names the env var as the source
+    monkeypatch.setenv("PI_WORKER_TIMEOUT_S", "600")
+    monkeypatch.setattr(p, "WORKER_TIMEOUT_S", 600)
+    result = _budget_launch()
+    assert "budget warn: timeout_s not set - defaulting to 600s (PI_WORKER_TIMEOUT_S)" in (
+        result.get("warnings") or []
+    ), result.get("warnings")
+
+    # unset wall_timeout_s with timeout 900 resolves to max(3600, 900+900) = 3600 and says so
+    monkeypatch.delenv("PI_WORKER_TIMEOUT_S", raising=False)
+    result = _budget_launch(timeout_s=900)
+    assert (
+        "budget warn: wall_timeout_s not set - defaulting to 3600s (max(3600, timeout_s + 900))"
+        in (result.get("warnings") or [])
+    ), result.get("warnings")
+
+    # unset min_tool_calls/max_nudges leave the nudge gate off and say so
+    result = _budget_launch(timeout_s=900, wall_timeout_s=4500)
+    assert (
+        "budget warn: min_tool_calls/max_nudges not set - nudge gate off "
+        "(nudge: >=3 tool calls, <=4 nudges then exit 3)"
+    ) in (result.get("warnings") or []), result.get("warnings")
+
+
+def test_explicit_budgets_produce_no_budget_warnings(monkeypatch):
+    monkeypatch.delenv("PI_WORKER_TIMEOUT_S", raising=False)
+    result = _budget_launch(timeout_s=600, wall_timeout_s=2400, min_tool_calls=2, max_nudges=1)
+    warnings = [w for w in result.get("warnings") or [] if w.startswith("budget warn:")]
+    assert warnings == [], warnings
+
+
+def test_unset_model_warning_still_names_deployment_default(tmp_path):
+    agent_dir = tmp_path / "agent-worker"
+    (agent_dir / "models.json").write_text(
+        json.dumps({"providers": {"omni": {"models": [{"id": "dflt"}]}}})
+    )
+    (agent_dir / "settings.json").write_text(json.dumps({"defaultModel": "dflt"}))
+    result = _budget_launch()
+    assert "error" not in result, result
+    assert any(
+        w.endswith("defaultModel (dflt)") and w.startswith("preflight warn: no model passed")
+        for w in result.get("warnings") or []
+    ), result.get("warnings")
