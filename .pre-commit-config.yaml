@@ -1,0 +1,31 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # v0.17.6
+    rev: "9026c9127e153371d7a78dfcb0c45ae2046a3d10"
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+        stages: [pre-commit]
+      - id: ruff-format
+        stages: [pre-commit]
+
+  - repo: local
+    hooks:
+      - id: function-length
+        name: function-length (flake8 CFQ001)
+        language: system
+        entry: uv run --with flake8 --with flake8-functions python -m flake8 --select=CFQ001 --max-function-length=100 .
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: file-length
+        name: file-length (pylint too-many-lines)
+        language: system
+        entry: uv run --with pylint python -m pylint --disable=all --enable=too-many-lines --max-module-lines=1000 --score=n __init__.py scripts tests
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: pytest
+        name: pytest
+        language: system
+        entry: uv run --with pytest python -m pytest tests -q
+        pass_filenames: false
+        stages: [pre-push]

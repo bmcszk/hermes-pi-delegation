@@ -22,6 +22,10 @@ jobs:
         run: uvx ruff check .
       - name: ruff format
         run: uvx ruff format --check .
+      - name: function-length (CFQ001)
+        run: uv run --with flake8 --with flake8-functions python -m flake8 --select=CFQ001 --max-function-length=100 .
+      - name: file-length (pylint too-many-lines)
+        run: uv run --with pylint python -m pylint --disable=all --enable=too-many-lines --max-module-lines=1000 --score=n __init__.py scripts tests
       - name: pytest
         run: uv run --with pytest python -m pytest tests -q
       - name: byte-compile

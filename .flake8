@@ -1,0 +1,5 @@
+# CFQ001 (flake8-functions): function length <= 100 - the user rule.
+# Ruff has no size rules by design (upstream declined; formatter can introduce
+# new violations), so length is enforced here, complexity stays in ruff.toml.
+[flake8]
+max-function-length = 100

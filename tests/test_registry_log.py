@@ -130,8 +130,9 @@ for i in range(25):
     sessions = {row["session"] for row in _rows(path)}
     assert sessions == {f"S{n}" for n in range(8)}, sessions
 
-    # and a reader polling while in-process writers rewrite the file never
-    # observes half a record
+
+def test_threaded_reader_never_sees_torn_record(tmp_path, monkeypatch):
+    """A reader polling while in-process writers rewrite never observes half a record."""
     import pi_rpc_client as mod
 
     thread_path = str(tmp_path / "threaded.jsonl")
