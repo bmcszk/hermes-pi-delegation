@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$(git rev-parse --show-toplevel)"
-uv run --with pytest python -m pytest tests -q

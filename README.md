@@ -418,28 +418,34 @@ fine, but a module inside `scripts/` must be imported after the guarded
 plugin root on the module path.
 
 ```sh
-uv run --with pytest python -m pytest tests -q
-uvx ruff check .
-python3 scripts/lint_lengths.py   # AST length limits: fn <=100 lines, file <=1000
-bash scripts/install-hooks        # copies hooks/ into .git/hooks/
+pre-commit install && pre-commit install-hooks   # wire the git hooks
+pre-commit run --all-files                       # run every hook once
 ```
 
 ### Coding standards enforcement
 
-Hard limits, checked three ways: `scripts/lint_lengths.py` (every function
-<=100 lines, every file <=1000 lines, AST-based), ruff rules `C901`,
-`PLR0912` (max 12 branches) and `PLR0915` (max 50 statements) in `ruff.toml`,
-and the self-check test `tests/test_coding_standards.py`, which runs the
-checker over the whole repo tree on every pytest run.
+Hard limits enforced by standard tooling, wired through the
+[pre-commit](https://pre-commit.com) framework (`.pre-commit-config.yaml`):
 
-Install the git hooks once per clone (`bash scripts/install-hooks`):
-`pre-commit` runs ruff check + format check + the length checker; `pre-push`
-runs the test suite.
+| tool | rule | limit |
+| --- | --- | --- |
+| ruff | complexity: `C901`, `PLR0912`, `PLR0915` (`ruff.toml`) | complexity 10, 12 branches, 50 statements |
+| flake8-functions | function length: `CFQ001` (`.flake8`) | 100 lines per function |
+| pylint | file length: `too-many-lines` | 1000 lines per file |
+
+The `pre-commit` stage runs ruff check (with autofix), ruff format, the
+flake8 `CFQ001` function-length check, and the pylint file-length check.
+The `pre-push` stage runs the test suite. Install once per clone with
+`pre-commit install && pre-commit install-hooks`.
+
+The self-check test `tests/test_coding_standards.py` runs the flake8 and
+pylint length commands over the repo on every pytest run, so the limits
+hold even without the hooks installed.
 
 Bypass policy: bypassing these checks (`--no-verify`, `# noqa`, rule
-weakening) is forbidden. CI is the backstop - the `coding-standards` step and
-pytest run on every PR, so any violation surfaces there regardless of local
-settings.
+weakening) is forbidden. CI is the backstop - the `function-length`,
+`file-length` and pytest steps run on every PR, so any violation surfaces
+there regardless of local settings.
 
 Layout:
 
