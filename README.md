@@ -420,7 +420,26 @@ plugin root on the module path.
 ```sh
 uv run --with pytest python -m pytest tests -q
 uvx ruff check .
+python3 scripts/lint_lengths.py   # AST length limits: fn <=100 lines, file <=1000
+bash scripts/install-hooks        # copies hooks/ into .git/hooks/
 ```
+
+### Coding standards enforcement
+
+Hard limits, checked three ways: `scripts/lint_lengths.py` (every function
+<=100 lines, every file <=1000 lines, AST-based), ruff rules `C901`,
+`PLR0912` (max 12 branches) and `PLR0915` (max 50 statements) in `ruff.toml`,
+and the self-check test `tests/test_coding_standards.py`, which runs the
+checker over the whole repo tree on every pytest run.
+
+Install the git hooks once per clone (`bash scripts/install-hooks`):
+`pre-commit` runs ruff check + format check + the length checker; `pre-push`
+runs the test suite.
+
+Bypass policy: bypassing these checks (`--no-verify`, `# noqa`, rule
+weakening) is forbidden. CI is the backstop - the `coding-standards` step and
+pytest run on every PR, so any violation surfaces there regardless of local
+settings.
 
 Layout:
 

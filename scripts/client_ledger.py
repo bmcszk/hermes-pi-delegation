@@ -181,6 +181,28 @@ def deliverable_verdict(path, sentinel):
         return "unmet"
 
 
+def _salvage_body(cwd, lines):
+    diff = subprocess.run(
+        ["git", "-C", cwd, "diff", "HEAD"], capture_output=True, text=True, timeout=30
+    )
+    body = [diff.stdout] if diff.returncode == 0 and diff.stdout.strip() else []
+    for ln in lines:
+        if not ln.startswith("??"):
+            continue
+        rel = ln[3:].strip()
+        if rel.endswith("/"):
+            continue
+        try:
+            with open(os.path.join(cwd, rel), encoding="utf-8", errors="replace") as f:
+                content = f.read(1024 * 1024)
+        except OSError:
+            continue
+        body.append(f"--- /dev/null\n+++ /dev/null (untracked: {rel})\n{content}")
+    if not body:
+        body = ["(no tracked diff; changes are staged-only)\n"]
+    return body
+
+
 def salvage_snapshot(session_id, cwd):
     """Snapshot the uncommitted worktree at a terminal-not-done exit.
 
@@ -203,24 +225,7 @@ def salvage_snapshot(session_id, cwd):
     lines = [ln for ln in proc.stdout.splitlines() if not ln.strip().endswith(".hermes/")]
     if not lines:
         return {"salvage_patch": None}
-    diff = subprocess.run(
-        ["git", "-C", cwd, "diff", "HEAD"], capture_output=True, text=True, timeout=30
-    )
-    body = [diff.stdout] if diff.returncode == 0 and diff.stdout.strip() else []
-    for ln in lines:
-        if not ln.startswith("??"):
-            continue
-        rel = ln[3:].strip()
-        if rel.endswith("/"):
-            continue
-        try:
-            with open(os.path.join(cwd, rel), encoding="utf-8", errors="replace") as f:
-                content = f.read(1024 * 1024)
-        except OSError:
-            continue
-        body.append(f"--- /dev/null\n+++ /dev/null (untracked: {rel})\n{content}")
-    if not body:
-        body = ["(no tracked diff; changes are staged-only)\n"]
+    body = _salvage_body(cwd, lines)
     patch_text = "\n".join(body)[: 4 * 1024 * 1024]
     patch_path = os.path.join(cwd, rel_patch)
     try:

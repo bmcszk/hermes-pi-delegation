@@ -423,14 +423,11 @@ class PiRpcClient:
                 ) from exc
             self._log_frame(frame)
             self._note_tools(frame)
-            if frame.get("type") == "response" and frame.get("command") == "prompt":
-                data = frame.get("data") or {}
-                disposition = data.get("disposition")
-                if frame.get("success") is False:
-                    raise RuntimeError(f"prompt rejected: {frame}")
-                if disposition == "handled":
-                    # ack says no run started: agent_end will never come
-                    return ""
+            if self._is_prompt_rejection(frame):
+                raise RuntimeError(f"prompt rejected: {frame}")
+            if self._is_prompt_handled(frame):
+                # ack says no run started: agent_end will never come
+                return ""
             # message_update frames stream partial content; the terminal
             # agent_end carries the final messages, which is what we return.
             if frame.get("type") == "agent_end":
@@ -438,6 +435,16 @@ class PiRpcClient:
                     parts.extend(self._assistant_text_parts(message))
                 break
         return "".join(parts)
+
+    @staticmethod
+    def _is_prompt_rejection(frame: dict) -> bool:
+        return frame.get("type") == "response" and frame.get("success") is False
+
+    @staticmethod
+    def _is_prompt_handled(frame: dict) -> bool:
+        if frame.get("type") != "response" or frame.get("command") != "prompt":
+            return False
+        return (frame.get("data") or {}).get("disposition") == "handled"
 
     @staticmethod
     def _assistant_text_parts(frame: dict) -> list[str]:

@@ -33,6 +33,21 @@ def resolve_skill_name(name, cwd):
     ~/.pi/skills. Path-form entries never reach this function.
     """
     home = os.path.expanduser("~")
+    found = _skill_in_tree(name, cwd)
+    if found:
+        return found
+    candidates = [
+        os.path.join(home, ".agents", "skills", name),
+        _hermes_skill(name, home),
+        os.path.join(home, ".pi", "skills", name),
+    ]
+    for cand in candidates:
+        if cand and os.path.isdir(cand):
+            return cand
+    return None
+
+
+def _skill_in_tree(name, cwd):
     root = os.path.realpath(cwd)
     while True:
         for sub in (".agents/skills", ".pi/skills"):
@@ -41,21 +56,17 @@ def resolve_skill_name(name, cwd):
                 return cand
         parent = os.path.dirname(root)
         if parent == root:
-            break
+            return None
         root = parent
-    cand = os.path.join(home, ".agents", "skills", name)
-    if os.path.isdir(cand):
-        return cand
+
+
+def _hermes_skill(name, home):
     base = os.path.join(home, ".hermes", "skills")
-    if os.path.isdir(base):
-        cand = os.path.join(base, name)
+    if not os.path.isdir(base):
+        return None
+    for cand in [os.path.join(base, name)] + [
+        os.path.join(base, cat, name) for cat in sorted(os.listdir(base))
+    ]:
         if os.path.isdir(cand):
             return cand
-        for cat in sorted(os.listdir(base)):
-            cand = os.path.join(base, cat, name)
-            if os.path.isdir(cand):
-                return cand
-    cand = os.path.join(home, ".pi", "skills", name)
-    if os.path.isdir(cand):
-        return cand
     return None

@@ -22,6 +22,8 @@ jobs:
         run: uvx ruff check .
       - name: ruff format
         run: uvx ruff format --check .
+      - name: coding-standards
+        run: python scripts/lint_lengths.py
       - name: pytest
         run: uv run --with pytest python -m pytest tests -q
       - name: byte-compile

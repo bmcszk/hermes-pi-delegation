@@ -1,0 +1,15 @@
+extend = "pyproject.toml"
+
+[lint]
+# mccabe: function complexity cap; PLR0912/PLR0915: branch and statement caps.
+extend-select = ["C901", "PLR0912", "PLR0915"]
+
+[lint.mccabe]
+max-complexity = 10
+
+[lint.pylint]
+max-branches = 12
+max-statements = 50
+# PLR0913 (max-args) deliberately NOT enabled: tool impl signatures mirror the
+# JSON schema param list by design (17 args on pi_launch) - signature mirror,
+# not complexity.
