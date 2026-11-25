@@ -44,6 +44,10 @@ Generates one worker dispatch.
 | `timeout_s` | no | Idle budget per dispatch. Defaults to `PI_WORKER_TIMEOUT_S`, 900 s. |
 | `wall_timeout_s` | no | Hard ceiling on the whole dispatch. Defaults to `max(3600, timeout_s + 900)`. |
 
+Unset budgets (`timeout_s`, `wall_timeout_s`, `min_tool_calls`/`max_nudges`)
+produce a `budget warn:` naming the resolved default value and its source;
+explicit values produce no budget warnings.
+
 Preflight validates the dispatch before anything spawns: the `model` alias is
 checked against the deployment's own model list (`models.json` plus
 `defaultModel`, both read from the worker agent dir — an unknown alias is a
