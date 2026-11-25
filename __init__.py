@@ -516,15 +516,29 @@ def _file_sha(path):
         return hashlib.sha256(handle.read()).hexdigest()
 
 
-_LOADED_SHA = _file_sha(__file__)
+def _plugin_digest():
+    """Deterministic digest over every plugin *.py file (init + scripts)."""
+    plugin_dir = os.path.dirname(os.path.abspath(__file__))
+    entries = []
+    for dirpath, dirnames, filenames in os.walk(plugin_dir):
+        dirnames[:] = [d for d in dirnames if d not in ("__pycache__", ".git")]
+        for filename in filenames:
+            if filename.endswith(".py"):
+                full = os.path.join(dirpath, filename)
+                rel = os.path.relpath(full, plugin_dir)
+                entries.append((rel, _file_sha(full)))
+    entries.sort()
+    return hashlib.sha256(repr(entries).encode()).hexdigest()
+
+
+_LOADED_SHA = _plugin_digest()
 
 
 def _plugin_health():
-    """Report whether the running module is older than the file on disk."""
+    """Report whether the running plugin code is older than the code on disk."""
     health = {"stale": False, "loaded_sha": _LOADED_SHA, "disk_sha": _LOADED_SHA, "detail": ""}
     try:
-        with open(__file__, "rb") as handle:
-            disk_sha = hashlib.sha256(handle.read()).hexdigest()
+        disk_sha = _plugin_digest()
     except OSError as exc:
         health["detail"] = f"health unavailable: {exc}"
         return health
@@ -1853,7 +1867,7 @@ def _pi_launch_impl(
     # disk code (only hit if Hermes fails to hot-reload): tell the client to
     # skip its mtime staleness heuristic. A mid-call edit makes the hash
     # mismatch and drops the flag; the heuristic then applies.
-    if _file_sha(__file__) == _LOADED_SHA:
+    if _plugin_digest() == _LOADED_SHA:
         parts.append("--plugin-fresh")
     for skill in skills:
         parts.extend(["--skill", skill])
